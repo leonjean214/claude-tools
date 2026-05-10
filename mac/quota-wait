@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """
-quota-wait — 等到 Claude 额度可用再退出
+quota-wait — 检测 Claude 额度，可用时放行或触发续命
 
 用法：
-  quota-wait              # 额度满则等到重置，否则立即退出
+  quota-wait              # 额度满则阻塞等到重置，否则立即退出
   quota-wait --status     # 只打印当前状态，不等待
+  quota-wait --watch      # 后台守护：持续监控，满了等重置后自动触发 claude-resume.sh
   quota-wait --threshold 90  # 超过 90% 就等（默认 100）
 
-退出码：
-  0 = 额度可用
-  1 = 无法获取 token 或 API 失败
+退出码：0=可用  1=失败
 """
-import subprocess, json, urllib.request, datetime, sys, time, argparse
+import subprocess, json, urllib.request, datetime, sys, time, argparse, os, signal
+
+LOCKFILE = "/tmp/quota-watch.lock"
+RESUME_SCRIPT = os.path.expanduser("~/bin/claude-resume.sh")
+LOG = os.path.expanduser("~/quota-watch.log")
 
 def get_token():
     raw = subprocess.check_output(
@@ -27,16 +30,16 @@ def fetch_usage(token):
     )
     return json.load(urllib.request.urlopen(req, timeout=10))
 
-def parse_usage(data):
-    results = []
+def parse_windows(data):
+    out = []
     for key in ("five_hour", "seven_day"):
         w = data.get(key) or {}
-        u = w.get("utilization") or 0
+        u = float(w.get("utilization") or 0)
         r = w.get("resets_at") or ""
         if r:
             dt = datetime.datetime.fromisoformat(r).astimezone()
-            results.append((key, float(u), dt))
-    return results  # [(name, utilization%, reset_dt), ...]
+            out.append((key, u, dt))
+    return out
 
 def fmt_dt(dt):
     now = datetime.datetime.now().astimezone()
@@ -50,19 +53,107 @@ def bar(u):
     f = min(int(u / 100 * 20), 20)
     return "█" * f + "░" * (20 - f)
 
-def print_status(windows):
+def print_status(windows, file=sys.stdout):
     now = datetime.datetime.now().strftime("%H:%M:%S")
-    max_u = max(u for _, u, _ in windows) if windows else 0
-    overall = "🚫" if max_u >= 100 else "⚠️" if max_u >= 75 else "✅"
-    print(f"=== Claude 额度 {overall}  [{now}] ===")
+    max_u = max((u for _, u, _ in windows), default=0)
+    icon = "🚫" if max_u >= 100 else "⚠️" if max_u >= 75 else "✅"
+    print(f"=== Claude 额度 {icon}  [{now}] ===", file=file)
     for name, u, reset_dt in windows:
         label = "5h" if "five" in name else "7d"
-        print(f"{label}  [{bar(u)}] {u:.0f}%  reset {fmt_dt(reset_dt)}")
+        print(f"{label}  [{bar(u)}] {u:.0f}%  reset {fmt_dt(reset_dt)}", file=file)
+
+def watch_mode(token, threshold):
+    """后台守护：持续监控额度，满了等重置后触发 claude-resume.sh"""
+
+    # 防多实例
+    if os.path.exists(LOCKFILE):
+        try:
+            pid = int(open(LOCKFILE).read().strip())
+            os.kill(pid, 0)
+            print(f"quota-watch 已在运行 (PID {pid})，退出。", file=sys.stderr)
+            sys.exit(0)
+        except (ProcessLookupError, ValueError):
+            pass  # 旧 PID 已死，继续
+    with open(LOCKFILE, "w") as f:
+        f.write(str(os.getpid()))
+
+    def cleanup(sig=None, frame=None):
+        try: os.remove(LOCKFILE)
+        except: pass
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGINT, cleanup)
+
+    def log(msg):
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{ts}] {msg}"
+        print(line, flush=True)
+        with open(LOG, "a") as f:
+            f.write(line + "\n")
+
+    # /api/oauth/usage 是纯状态查询，不走 Messages API，不消耗 Claude 额度
+    POLL = 300  # 5min 查一次
+    log(f"quota-watch 启动 (PID {os.getpid()}, threshold={threshold}%, poll={POLL}s)")
+    fired = False
+
+    try:
+        while not fired:
+            try:
+                data = fetch_usage(token)
+                windows = parse_windows(data)
+            except Exception as e:
+                log(f"API 失败: {e}，{POLL}s 后重试")
+                time.sleep(POLL)
+                continue
+
+            max_u = max((u for _, u, _ in windows), default=0)
+            log(f"额度: " + "  ".join(
+                f"{'5h' if 'five' in n else '7d'}={u:.0f}%" for n, u, _ in windows
+            ))
+
+            blocked = [(u, dt) for _, u, dt in windows if u >= threshold]
+            if not blocked:
+                time.sleep(POLL)
+                continue
+
+            # 额度满，等到最早重置点 +1min
+            earliest = min(dt for _, dt in blocked)
+            wait_until = earliest + datetime.timedelta(minutes=1)
+            now = datetime.datetime.now().astimezone()
+            wait_secs = (wait_until - now).total_seconds()
+
+            if wait_secs > 0:
+                log(f"额度 {max_u:.0f}%，等到 {wait_until.strftime('%H:%M:%S')} 触发续命 ({int(wait_secs//60)}m后)")
+                while True:
+                    now = datetime.datetime.now().astimezone()
+                    remaining = (wait_until - now).total_seconds()
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(POLL, remaining))
+                    remaining = (wait_until - now).total_seconds()
+                    if remaining > 0:
+                        log(f"等待中… 还有 {int(remaining//60)}m{int(remaining%60):02d}s")
+
+            log(f"重置时间到，触发 claude-resume.sh")
+            try:
+                subprocess.Popen(
+                    ["/bin/bash", RESUME_SCRIPT],
+                    stdout=open(os.path.expanduser("~/claude-resume.log"), "a"),
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True
+                )
+                log("claude-resume.sh 已启动，quota-watch 退出。")
+            except Exception as e:
+                log(f"启动 claude-resume.sh 失败: {e}")
+            fired = True
+    finally:
+        cleanup()
 
 def main():
-    parser = argparse.ArgumentParser(description="等到 Claude 额度可用")
-    parser.add_argument("--status", action="store_true", help="只打印状态，不等待")
-    parser.add_argument("--threshold", type=float, default=100, help="触发等待的用量阈值（默认 100）")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--status", action="store_true")
+    parser.add_argument("--watch", action="store_true")
+    parser.add_argument("--threshold", type=float, default=100)
     args = parser.parse_args()
 
     try:
@@ -71,28 +162,29 @@ def main():
         print(f"❌ 获取 token 失败: {e}", file=sys.stderr)
         sys.exit(1)
 
+    if args.watch:
+        watch_mode(token, args.threshold)
+        return
+
     while True:
         try:
             data = fetch_usage(token)
-            windows = parse_usage(data)
+            windows = parse_windows(data)
         except Exception as e:
             print(f"❌ API 失败: {e}", file=sys.stderr)
             sys.exit(1)
 
         print_status(windows)
-
         if args.status:
             sys.exit(0)
 
-        # 找出超过阈值的窗口，取最早重置的那个
         blocked = [(u, dt) for _, u, dt in windows if u >= args.threshold]
         if not blocked:
             print("✅ 额度可用，继续。")
             sys.exit(0)
 
-        # 等到最早的重置时间 + 1min
-        earliest_reset = min(dt for _, dt in blocked)
-        wait_until = earliest_reset + datetime.timedelta(minutes=1)
+        earliest = min(dt for _, dt in blocked)
+        wait_until = earliest + datetime.timedelta(minutes=1)
         now = datetime.datetime.now().astimezone()
         wait_secs = (wait_until - now).total_seconds()
 
@@ -100,13 +192,9 @@ def main():
             print("✅ 重置时间已过，继续。")
             sys.exit(0)
 
-        wake_str = wait_until.strftime("%H:%M:%S")
-        print(f"⏳ 额度 {max(u for u,_ in blocked):.0f}%，等到 {wake_str} 再继续… (还有 {int(wait_secs//60)}m{int(wait_secs%60):02d}s)")
-
-        # 每 60s 打印一次倒计时，直到重置时间
-        check_interval = min(60, wait_secs)
-        time.sleep(check_interval)
-        # 重置后重新查一次确认
+        max_u = max(u for u, _ in blocked)
+        print(f"⏳ 额度 {max_u:.0f}%，等到 {wait_until.strftime('%H:%M:%S')} ({int(wait_secs//60)}m{int(wait_secs%60):02d}s)")
+        time.sleep(min(60, wait_secs))
         print()
 
 if __name__ == "__main__":
