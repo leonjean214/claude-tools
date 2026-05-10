@@ -113,6 +113,12 @@ powershell -ExecutionPolicy Bypass -File $env:USERPROFILE\bin\quota-wait.ps1 -Th
 
 A PID lock file (`/tmp/quota-watch.lock`) prevents duplicate daemons across multiple sessions.
 
+**First-time start:** `SessionStart` hooks only fire at the beginning of a session. If you add the hook mid-session, start the daemon once manually:
+```bash
+nohup ~/bin/quota-wait --watch >> ~/quota-watch.log 2>&1 &
+```
+From the next session onwards it starts automatically.
+
 **Polling interval:** 300 s (5 min). Since `/api/oauth/usage` is a plain GET with no AI inference, it consumes **zero Claude quota**.
 
 ---
@@ -209,6 +215,12 @@ powershell -ExecutionPolicy Bypass -File $env:USERPROFILE\bin\quota-wait.ps1 -Th
 
 PID 锁文件（`/tmp/quota-watch.lock`）防止多 session 启动多个实例。
 
+**首次启动：** `SessionStart` hook 只在 session **开始时**触发。如果是 session 中途才加的 hook，需手动启动一次：
+```bash
+nohup ~/bin/quota-wait --watch >> ~/quota-watch.log 2>&1 &
+```
+之后每次开 session 自动启动。
+
 **轮询间隔：** 300 秒（5 分钟）。`/api/oauth/usage` 是纯 GET 查询，无 AI 推理，**零额度消耗**。
 
 ---
@@ -266,6 +278,12 @@ Trois modes :
   }
 }
 ```
+
+**Premier démarrage :** Le hook `SessionStart` ne se déclenche qu'au début d'une session. Si vous avez ajouté le hook en cours de session, démarrez le démon une fois manuellement :
+```bash
+nohup ~/bin/quota-wait --watch >> ~/quota-watch.log 2>&1 &
+```
+Dès la session suivante, le démarrage est automatique.
 
 Intervalle de scrutation : **300 s**. Consommation de quota Claude : **zéro**.
 
