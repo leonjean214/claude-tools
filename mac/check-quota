@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+import subprocess, json, urllib.request, urllib.error, datetime, sys
+
+def get_token():
+    raw = subprocess.check_output(
+        ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+        text=True, stderr=subprocess.DEVNULL
+    ).strip()
+    return json.loads(raw)["claudeAiOauth"]["accessToken"]
+
+def fmt_ts(ts_str):
+    if not ts_str: return "?"
+    try:
+        dt = datetime.datetime.fromtimestamp(int(ts_str)).astimezone()
+        now = datetime.datetime.now().astimezone()
+        mins = int((dt - now).total_seconds() / 60)
+        t = dt.strftime("%H:%M")
+        if mins < 0: return f"{t}(已过)"
+        if mins < 60: return f"{t}({mins}m后)"
+        return f"{t}({mins//60}h{mins%60:02d}m后)"
+    except:
+        return ts_str
+
+def bar(u):
+    try:
+        f = int(float(u) * 20)
+        return "█" * f + "░" * (20 - f)
+    except:
+        return "?" * 20
+
+try:
+    token = get_token()
+except Exception as e:
+    print(f"❌ 获取 token 失败: {e}")
+    sys.exit(1)
+
+req = urllib.request.Request(
+    "https://api.anthropic.com/v1/messages",
+    data=json.dumps({
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "1"}]
+    }).encode(),
+    headers={
+        "Authorization": f"Bearer {token}",
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json",
+    },
+    method="POST",
+)
+
+try:
+    resp = urllib.request.urlopen(req, timeout=10)
+    h = {k.lower(): v for k, v in resp.headers.items()}
+except urllib.error.HTTPError as e:
+    h = {k.lower(): v for k, v in e.headers.items()}
+except Exception as e:
+    print(f"❌ API 调用失败: {e}")
+    sys.exit(1)
+
+status   = h.get("anthropic-ratelimit-unified-status", "unknown")
+util_5h  = h.get("anthropic-ratelimit-unified-5h-utilization", "0")
+reset_5h = h.get("anthropic-ratelimit-unified-5h-reset", "")
+st_5h    = h.get("anthropic-ratelimit-unified-5h-status", "")
+util_7d  = h.get("anthropic-ratelimit-unified-7d-utilization", "0")
+reset_7d = h.get("anthropic-ratelimit-unified-7d-reset", "")
+st_7d    = h.get("anthropic-ratelimit-unified-7d-status", "")
+
+emoji = "✅" if status == "allowed" else "⚠️" if "warning" in status else "🚫"
+now_str = datetime.datetime.now().strftime("%H:%M:%S")
+
+print(f"=== Claude 额度 {emoji} {status}  [{now_str}] ===")
+print(f"5h  [{bar(util_5h)}] {float(util_5h):.0%}  reset {fmt_ts(reset_5h)}  {st_5h}")
+print(f"7d  [{bar(util_7d)}] {float(util_7d):.0%}  reset {fmt_ts(reset_7d)}  {st_7d}")
