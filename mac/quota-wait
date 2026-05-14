@@ -154,6 +154,25 @@ def watch_mode(threshold):
                     if remaining > 0:
                         log(f"等待中… 还有 {int(remaining//60)}m{int(remaining%60):02d}s")
 
+            # 如果 Claude Code 交互进程正在运行，让 UI 的 stop-and-wait 自己处理
+            try:
+                ps = subprocess.run(["pgrep", "-lf", "claude"], capture_output=True, text=True)
+                interactive_running = any(
+                    ".local/bin/claude" in line
+                    and " -p " not in line
+                    and "--print" not in line
+                    and "quota-wait" not in line
+                    and "claude-resume" not in line
+                    for line in ps.stdout.splitlines()
+                )
+            except Exception:
+                interactive_running = False
+
+            if interactive_running:
+                log("检测到 Claude Code 交互进程运行中，跳过自动触发（UI stop-and-wait 会处理）。quota-watch 退出。")
+                fired = True
+                continue
+
             log(f"重置时间到，触发 claude-resume.sh")
             try:
                 subprocess.Popen(
