@@ -62,20 +62,24 @@ def print_status(windows, file=sys.stdout):
         label = "5h" if "five" in name else "7d"
         print(f"{label}  [{bar(u)}] {u:.0f}%  reset {fmt_dt(reset_dt)}", file=file)
 
-def watch_mode(token, threshold):
+def watch_mode(threshold):
     """后台守护：持续监控额度，满了等重置后触发 claude-resume.sh"""
 
-    # 防多实例
-    if os.path.exists(LOCKFILE):
+    # 防多实例：open(..., 'x') 是原子操作，彻底消除竞态
+    while True:
         try:
-            pid = int(open(LOCKFILE).read().strip())
-            os.kill(pid, 0)
-            print(f"quota-watch 已在运行 (PID {pid})，退出。", file=sys.stderr)
-            sys.exit(0)
-        except (ProcessLookupError, ValueError):
-            pass  # 旧 PID 已死，继续
-    with open(LOCKFILE, "w") as f:
-        f.write(str(os.getpid()))
+            with open(LOCKFILE, 'x') as f:
+                f.write(str(os.getpid()))
+            break  # 成功拿到锁
+        except FileExistsError:
+            try:
+                pid = int(open(LOCKFILE).read().strip())
+                os.kill(pid, 0)
+                print(f"quota-watch 已在运行 (PID {pid})，退出。", file=sys.stderr)
+                sys.exit(0)
+            except (ProcessLookupError, ValueError):
+                try: os.remove(LOCKFILE)
+                except FileNotFoundError: pass  # 另一进程已删，重试
 
     def cleanup(sig=None, frame=None):
         try: os.remove(LOCKFILE)
@@ -87,12 +91,14 @@ def watch_mode(token, threshold):
     def log(msg):
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         line = f"[{ts}] {msg}"
-        print(line, flush=True)
         with open(LOG, "a") as f:
             f.write(line + "\n")
+        if sys.stdout.isatty():
+            print(line, flush=True)
 
     # /api/oauth/usage 是纯状态查询，不走 Messages API，不消耗 Claude 额度
     POLL = 300  # 5min 查一次
+    token = get_token()
     log(f"quota-watch 启动 (PID {os.getpid()}, threshold={threshold}%, poll={POLL}s)")
     fired = False
 
@@ -101,6 +107,20 @@ def watch_mode(token, threshold):
             try:
                 data = fetch_usage(token)
                 windows = parse_windows(data)
+            except urllib.error.HTTPError as e:
+                if e.code == 401:
+                    log("Token 过期，重新获取…")
+                    try:
+                        token = get_token()
+                        log("Token 已刷新，立即重试")
+                        time.sleep(5)
+                    except Exception as te:
+                        log(f"刷新 token 失败: {te}，{POLL}s 后重试")
+                        time.sleep(POLL)
+                else:
+                    log(f"API 失败: {e}，{POLL}s 后重试")
+                    time.sleep(POLL)
+                continue
             except Exception as e:
                 log(f"API 失败: {e}，{POLL}s 后重试")
                 time.sleep(POLL)
@@ -156,15 +176,15 @@ def main():
     parser.add_argument("--threshold", type=float, default=100)
     args = parser.parse_args()
 
+    if args.watch:
+        watch_mode(args.threshold)
+        return
+
     try:
         token = get_token()
     except Exception as e:
         print(f"❌ 获取 token 失败: {e}", file=sys.stderr)
         sys.exit(1)
-
-    if args.watch:
-        watch_mode(token, args.threshold)
-        return
 
     while True:
         try:
