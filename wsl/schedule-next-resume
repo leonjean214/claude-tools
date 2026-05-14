@@ -1,0 +1,95 @@
+#!/bin/bash
+# 把 Windows Task Scheduler 的 ClaudeResumeWSL 任务设为最优触发时间
+# 用法:  schedule-next-resume          # 自动选最优时间
+#       schedule-next-resume 1234567   # 指定 Unix timestamp
+set -u
+
+RESUME_SCRIPT="$HOME/bin/claude-resume.sh"
+TASK_NAME="ClaudeResumeWSL"
+LOG="$HOME/claude-resume.log"
+
+# ── Token resolution (Linux creds → Windows creds fallback) ────────────────────
+
+_get_token() {
+    local creds_linux="$HOME/.claude/.credentials.json"
+    local win_user
+    win_user=$(cmd.exe /c "echo %USERNAME%" 2>/dev/null | tr -d '\r\n')
+    local creds_win="/mnt/c/Users/${win_user}/.claude/.credentials.json"
+
+    local creds_file=""
+    if [ -f "$creds_linux" ]; then
+        creds_file="$creds_linux"
+    elif [ -n "$win_user" ] && [ -f "$creds_win" ]; then
+        creds_file="$creds_win"
+    fi
+
+    [ -z "$creds_file" ] && return 1
+    python3 -c "import json,sys; print(json.load(sys.stdin)['claudeAiOauth']['accessToken'])" \
+        < "$creds_file" 2>/dev/null
+}
+
+# ── Determine target Unix timestamp ────────────────────────────────────────────
+
+if [ "$#" -ge 1 ]; then
+    TS="$1"
+else
+    NOW_TS=$(date +%s)
+    DEFAULT_TS=$(( NOW_TS + 5 * 3600 ))
+    TS="$DEFAULT_TS"
+
+    _TOKEN=$(_get_token 2>/dev/null || true)
+    if [ -n "$_TOKEN" ]; then
+        _QUOTA_JSON=$(curl -s "https://api.anthropic.com/api/oauth/usage" \
+            -H "Authorization: Bearer $_TOKEN" 2>/dev/null)
+        _RESET_TS=$(echo "$_QUOTA_JSON" | python3 -c "
+import json, sys, datetime
+try:
+    d = json.load(sys.stdin)
+    candidates = []
+    for key in ('five_hour', 'seven_day'):
+        w = d.get(key) or {}
+        r = w.get('resets_at') or ''
+        if r:
+            dt = datetime.datetime.fromisoformat(r).astimezone()
+            candidates.append(int(dt.timestamp()))
+    if candidates: print(min(candidates))
+except: pass
+" 2>/dev/null || true)
+        if [ -n "$_RESET_TS" ] && [ "$_RESET_TS" -lt "$DEFAULT_TS" ]; then
+            TS=$(( _RESET_TS + 60 ))
+        fi
+    fi
+fi
+
+# ── Format times ────────────────────────────────────────────────────────────────
+
+NEXT_HUMAN=$(date -d "@$TS" '+%Y-%m-%d %H:%M:%S %Z')
+# ISO 8601 format that Task Scheduler accepts ("yyyy-MM-ddTHH:mm:ss")
+ISO_TIME=$(date -d "@$TS" '+%Y-%m-%dT%H:%M:%S')
+
+NOW_TS2=$(date +%s)
+MINS_AWAY=$(( (TS - NOW_TS2) / 60 ))
+
+# ── Register Task Scheduler task via powershell.exe ────────────────────────────
+
+SCHEDULED=false
+if command -v powershell.exe >/dev/null 2>&1; then
+    powershell.exe -NoProfile -Command "
+        \$a = New-ScheduledTaskAction -Execute 'wsl.exe' -Argument \"-e bash \`\"$RESUME_SCRIPT\`\"\"
+        \$t = New-ScheduledTaskTrigger -Once -At '$ISO_TIME'
+        \$s = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit '02:00:00' -MultipleInstances IgnoreNew
+        Unregister-ScheduledTask -TaskName '$TASK_NAME' -Confirm:\$false -ErrorAction SilentlyContinue
+        Register-ScheduledTask -TaskName '$TASK_NAME' -Action \$a -Trigger \$t -Settings \$s -RunLevel Highest -Force | Out-Null
+    " 2>/dev/null && SCHEDULED=true
+fi
+
+if [ "$SCHEDULED" = false ]; then
+    # Fallback: write a one-shot at-job via cron (requires cron to be running in WSL)
+    # This is best-effort; the user should ensure cron is enabled in WSL.
+    CRON_LINE="$(date -d "@$TS" '+%M %H %d %m') * bash \"$RESUME_SCRIPT\" # ClaudeResumeWSL $NEXT_HUMAN"
+    ( crontab -l 2>/dev/null | grep -v "# ClaudeResumeWSL"; echo "$CRON_LINE" ) | crontab - 2>/dev/null
+    echo "WARNING: powershell.exe unavailable, scheduled via cron instead." | tee -a "$LOG" >&2
+fi
+
+echo "🔁 auto-resume scheduled: $NEXT_HUMAN (${MINS_AWAY}m後)"
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Scheduled next resume at $NEXT_HUMAN (${MINS_AWAY}m後)" >> "$LOG"
