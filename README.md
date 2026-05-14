@@ -43,6 +43,10 @@ Non-destructive and reversible (`-X DELETE` to unstar). No user confirmation nee
 | `windows/quota-wait.ps1` | Windows | Block until quota available; `-Watch` daemon mode |
 | `mac/schedule-next-resume` | macOS | Schedule launchd at exact quota reset time |
 | `mac/claude-resume.sh` | macOS | Auto-resume script: continues last conversation when quota refills |
+| `windows/schedule-next-resume.ps1` | Windows | Schedule Task Scheduler at exact quota reset time |
+| `windows/claude-resume.ps1` | Windows | Auto-resume script: continues last conversation when quota refills |
+| `wsl/schedule-next-resume` | WSL | Schedule Windows Task Scheduler from WSL at quota reset time |
+| `wsl/claude-resume.sh` | WSL | Auto-resume script for WSL: continues last conversation when quota refills |
 
 ---
 
@@ -250,6 +254,113 @@ launchd fires claude-resume.sh at reset_time+1min
 
 ---
 
+### `schedule-next-resume.ps1` — Task Scheduler scheduler (Windows)
+
+PowerShell equivalent of `mac/schedule-next-resume`. Updates the `ClaudeResume` Task Scheduler task to the optimal next time.
+
+```powershell
+Copy-Item windows\schedule-next-resume.ps1 $env:USERPROFILE\bin\schedule-next-resume.ps1
+
+# auto-pick optimal time
+powershell -ExecutionPolicy Bypass -File $env:USERPROFILE\bin\schedule-next-resume.ps1
+
+# explicit Unix timestamp
+powershell -ExecutionPolicy Bypass -File $env:USERPROFILE\bin\schedule-next-resume.ps1 -At 1747260000
+```
+
+Add to `SessionStart` hook in `%USERPROFILE%\.claude\settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{"hooks": [
+      {"type": "command", "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"%USERPROFILE%\\bin\\schedule-next-resume.ps1\" 2>nul"}
+    ]}]
+  }
+}
+```
+
+---
+
+### `claude-resume.ps1` — Auto-resume script (Windows)
+
+PowerShell equivalent of `mac/claude-resume.sh`. Triggered by Task Scheduler.
+
+```powershell
+Copy-Item windows\claude-resume.ps1 $env:USERPROFILE\bin\claude-resume.ps1
+```
+
+Logs to `%USERPROFILE%\claude-resume.log`.
+
+**Full setup — `settings.json` for Windows:**
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{"hooks": [
+      {"type": "command", "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"%USERPROFILE%\\bin\\check-quota.ps1\" 2>nul"},
+      {"type": "command", "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"%USERPROFILE%\\bin\\schedule-next-resume.ps1\" 2>nul"},
+      {"type": "command", "command": "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"%USERPROFILE%\\bin\\quota-wait.ps1\" -Watch 2>nul &"}
+    ]}],
+    "Stop": [{"hooks": [
+      {"type": "command", "command": "cmd /c \"echo %CD%> %USERPROFILE%\\.claude-resume-dir\""}
+    ]}]
+  }
+}
+```
+
+---
+
+### `wsl/schedule-next-resume` — Task Scheduler scheduler (WSL)
+
+Same logic as the Mac/Windows versions, but runs from inside WSL and schedules a `ClaudeResumeWSL` task via `powershell.exe`. Falls back to cron if `powershell.exe` is unavailable.
+
+Token resolution: tries `~/.claude/.credentials.json` first, then falls back to `/mnt/c/Users/<WIN_USER>/.claude/.credentials.json`.
+
+```bash
+cp wsl/schedule-next-resume ~/bin/schedule-next-resume && chmod +x ~/bin/schedule-next-resume
+
+schedule-next-resume              # auto-pick optimal time
+schedule-next-resume 1747260000   # explicit Unix timestamp
+```
+
+Add to WSL Claude Code's `~/.claude/settings.json` `SessionStart` hook (same format as Mac).
+
+---
+
+### `wsl/claude-resume.sh` — Auto-resume script (WSL)
+
+Identical flow to `mac/claude-resume.sh`, adapted for WSL:
+- GNU `date -d "@$TS"` instead of BSD `date -r`
+- Dual-path token resolution (Linux creds → Windows creds fallback)
+- Prefers `~/.local/bin/claude` if present, falls back to `claude` on `$PATH`
+- Calls `~/bin/schedule-next-resume` (the WSL version) to chain next fire
+
+```bash
+cp wsl/claude-resume.sh ~/bin/claude-resume.sh && chmod +x ~/bin/claude-resume.sh
+```
+
+**Full setup — WSL `~/.claude/settings.json`:**
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{"hooks": [
+      {"type": "command", "command": "~/bin/check-quota 2>/dev/null || true"},
+      {"type": "command", "command": "~/bin/schedule-next-resume 2>&1 || true"},
+      {"type": "command", "command": "nohup ~/bin/quota-wait --watch >> ~/quota-watch.log 2>&1 &"}
+    ]}],
+    "Stop": [{"hooks": [
+      {"type": "command", "command": "echo \"$(pwd)\" > ~/.claude-resume-dir 2>/dev/null || true"}
+    ]}]
+  }
+}
+```
+
+*(Requires `mac/quota-wait` installed in WSL as `~/bin/quota-wait` — it is pure Python and runs on Linux unchanged.)*
+
+---
+
 ## 中文
 
 ### 脚本一览
@@ -262,6 +373,10 @@ launchd fires claude-resume.sh at reset_time+1min
 | `windows/quota-wait.ps1` | Windows | 阻塞等待额度可用；`-Watch` 守护模式 |
 | `mac/schedule-next-resume` | macOS | 按额度重置时间精确调度 launchd |
 | `mac/claude-resume.sh` | macOS | 自动续命：额度恢复时续接上次对话 |
+| `windows/schedule-next-resume.ps1` | Windows | 按额度重置时间精确调度 Task Scheduler |
+| `windows/claude-resume.ps1` | Windows | 自动续命：额度恢复时续接上次对话 |
+| `wsl/schedule-next-resume` | WSL | 从 WSL 调度 Windows Task Scheduler |
+| `wsl/claude-resume.sh` | WSL | WSL 自动续命：额度恢复时续接上次对话 |
 
 ---
 
@@ -456,6 +571,108 @@ launchd 在 重置时间+1min 触发 claude-resume.sh
 
 ---
 
+### `schedule-next-resume.ps1` — Task Scheduler 调度器（Windows）
+
+`mac/schedule-next-resume` 的 PowerShell 等价版本。将 `ClaudeResume` 计划任务设为最优触发时间。
+
+```powershell
+Copy-Item windows\schedule-next-resume.ps1 $env:USERPROFILE\bin\schedule-next-resume.ps1
+
+# 自动选最优时间
+powershell -ExecutionPolicy Bypass -File $env:USERPROFILE\bin\schedule-next-resume.ps1
+
+# 指定 Unix timestamp
+powershell -ExecutionPolicy Bypass -File $env:USERPROFILE\bin\schedule-next-resume.ps1 -At 1747260000
+```
+
+加入 `%USERPROFILE%\.claude\settings.json` 的 `SessionStart` hook：
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{"hooks": [
+      {"type": "command", "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"%USERPROFILE%\\bin\\schedule-next-resume.ps1\" 2>nul"}
+    ]}]
+  }
+}
+```
+
+---
+
+### `claude-resume.ps1` — 自动续命脚本（Windows）
+
+`mac/claude-resume.sh` 的 PowerShell 等价版本。由 Task Scheduler 触发。
+
+```powershell
+Copy-Item windows\claude-resume.ps1 $env:USERPROFILE\bin\claude-resume.ps1
+```
+
+日志写入 `%USERPROFILE%\claude-resume.log`。
+
+**完整配置 — Windows `settings.json`：**
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{"hooks": [
+      {"type": "command", "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"%USERPROFILE%\\bin\\check-quota.ps1\" 2>nul"},
+      {"type": "command", "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"%USERPROFILE%\\bin\\schedule-next-resume.ps1\" 2>nul"},
+      {"type": "command", "command": "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"%USERPROFILE%\\bin\\quota-wait.ps1\" -Watch 2>nul &"}
+    ]}],
+    "Stop": [{"hooks": [
+      {"type": "command", "command": "cmd /c \"echo %CD%> %USERPROFILE%\\.claude-resume-dir\""}
+    ]}]
+  }
+}
+```
+
+---
+
+### `wsl/schedule-next-resume` — Task Scheduler 调度器（WSL）
+
+从 WSL 内部调用 `powershell.exe Register-ScheduledTask`，创建 `ClaudeResumeWSL` 计划任务。`powershell.exe` 不可用时退回 cron。
+
+Token 路径：优先 `~/.claude/.credentials.json`，回退到 `/mnt/c/Users/<WIN_USER>/.claude/.credentials.json`。
+
+```bash
+cp wsl/schedule-next-resume ~/bin/schedule-next-resume && chmod +x ~/bin/schedule-next-resume
+```
+
+---
+
+### `wsl/claude-resume.sh` — 自动续命脚本（WSL）
+
+与 `mac/claude-resume.sh` 流程完全一致，WSL 差异：
+
+- GNU `date -d "@$TS"`（非 BSD `date -r`）
+- 双路径 token 解析（Linux 凭据 → Windows 凭据回退）
+- 优先 `~/.local/bin/claude`，回退到 `$PATH` 中的 `claude`
+
+```bash
+cp wsl/claude-resume.sh ~/bin/claude-resume.sh && chmod +x ~/bin/claude-resume.sh
+```
+
+**完整配置 — WSL `~/.claude/settings.json`：**
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{"hooks": [
+      {"type": "command", "command": "~/bin/check-quota 2>/dev/null || true"},
+      {"type": "command", "command": "~/bin/schedule-next-resume 2>&1 || true"},
+      {"type": "command", "command": "nohup ~/bin/quota-wait --watch >> ~/quota-watch.log 2>&1 &"}
+    ]}],
+    "Stop": [{"hooks": [
+      {"type": "command", "command": "echo \"$(pwd)\" > ~/.claude-resume-dir 2>/dev/null || true"}
+    ]}]
+  }
+}
+```
+
+*（需要将 `mac/quota-wait` 安装到 WSL 的 `~/bin/quota-wait`，该脚本为纯 Python，在 Linux 下直接可用。）*
+
+---
+
 ## Français
 
 ### Scripts disponibles
@@ -468,6 +685,10 @@ launchd 在 重置时间+1min 触发 claude-resume.sh
 | `windows/quota-wait.ps1` | Windows | Attente bloquante ; mode démon `-Watch` |
 | `mac/schedule-next-resume` | macOS | Planifie launchd à l'heure exacte de réinitialisation |
 | `mac/claude-resume.sh` | macOS | Reprise automatique : continue la dernière conversation au reset |
+| `windows/schedule-next-resume.ps1` | Windows | Planifie Task Scheduler à l'heure exacte de réinitialisation |
+| `windows/claude-resume.ps1` | Windows | Reprise automatique : continue la dernière conversation au reset |
+| `wsl/schedule-next-resume` | WSL | Planifie Windows Task Scheduler depuis WSL |
+| `wsl/claude-resume.sh` | WSL | Reprise automatique WSL : continue la dernière conversation au reset |
 
 ---
 
@@ -564,6 +785,88 @@ cp mac/claude-resume.sh ~/bin/claude-resume.sh && chmod +x ~/bin/claude-resume.s
 ```
 
 **Configuration complète — `settings.json` :**
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{"hooks": [
+      {"type": "command", "command": "~/bin/check-quota 2>/dev/null || true"},
+      {"type": "command", "command": "~/bin/schedule-next-resume 2>&1 || true"},
+      {"type": "command", "command": "nohup ~/bin/quota-wait --watch >> ~/quota-watch.log 2>&1 &"}
+    ]}],
+    "Stop": [{"hooks": [
+      {"type": "command", "command": "echo \"$(pwd)\" > ~/.claude-resume-dir 2>/dev/null || true"}
+    ]}]
+  }
+}
+```
+
+---
+
+### `schedule-next-resume.ps1` — Planificateur Task Scheduler (Windows)
+
+Équivalent PowerShell de `mac/schedule-next-resume`. Met à jour la tâche `ClaudeResume` dans le Planificateur de tâches Windows.
+
+```powershell
+Copy-Item windows\schedule-next-resume.ps1 $env:USERPROFILE\bin\schedule-next-resume.ps1
+
+# temps optimal automatique
+powershell -ExecutionPolicy Bypass -File $env:USERPROFILE\bin\schedule-next-resume.ps1
+
+# horodatage Unix explicite
+powershell -ExecutionPolicy Bypass -File $env:USERPROFILE\bin\schedule-next-resume.ps1 -At 1747260000
+```
+
+---
+
+### `claude-resume.ps1` — Script de reprise automatique (Windows)
+
+Équivalent PowerShell de `mac/claude-resume.sh`. Déclenché par le Planificateur de tâches.
+
+```powershell
+Copy-Item windows\claude-resume.ps1 $env:USERPROFILE\bin\claude-resume.ps1
+```
+
+Journaux dans `%USERPROFILE%\claude-resume.log`.
+
+**Configuration complète — `settings.json` Windows :**
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{"hooks": [
+      {"type": "command", "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"%USERPROFILE%\\bin\\check-quota.ps1\" 2>nul"},
+      {"type": "command", "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"%USERPROFILE%\\bin\\schedule-next-resume.ps1\" 2>nul"},
+      {"type": "command", "command": "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"%USERPROFILE%\\bin\\quota-wait.ps1\" -Watch 2>nul &"}
+    ]}],
+    "Stop": [{"hooks": [
+      {"type": "command", "command": "cmd /c \"echo %CD%> %USERPROFILE%\\.claude-resume-dir\""}
+    ]}]
+  }
+}
+```
+
+---
+
+### `wsl/schedule-next-resume` — Planificateur Task Scheduler (WSL)
+
+Appelle `powershell.exe Register-ScheduledTask` depuis WSL pour créer la tâche `ClaudeResumeWSL`. Repli sur cron si `powershell.exe` est indisponible.
+
+```bash
+cp wsl/schedule-next-resume ~/bin/schedule-next-resume && chmod +x ~/bin/schedule-next-resume
+```
+
+---
+
+### `wsl/claude-resume.sh` — Script de reprise automatique (WSL)
+
+Même flux que `mac/claude-resume.sh`, adapté pour WSL : `date -d "@$TS"` GNU, résolution de token double-chemin (credentials Linux → credentials Windows en fallback), préfère `~/.local/bin/claude`.
+
+```bash
+cp wsl/claude-resume.sh ~/bin/claude-resume.sh && chmod +x ~/bin/claude-resume.sh
+```
+
+**Configuration complète — WSL `~/.claude/settings.json` :**
 
 ```json
 {
