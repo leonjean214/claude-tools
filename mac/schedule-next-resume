@@ -1,0 +1,86 @@
+#!/bin/bash
+# 把 launchd 的下次触发时间设为 now+5h 或最近额度重置点+1min，取更早的
+# 用法:  schedule-next-resume          # 自动选最优时间
+#       schedule-next-resume 1234567   # explicit unix timestamp
+set -u
+PLIST="$HOME/Library/LaunchAgents/com.leon.claude-resume.plist"
+SCRIPT="$HOME/bin/claude-resume.sh"
+LOG="$HOME/claude-resume.log"
+
+if [ "$#" -ge 1 ]; then
+  TS="$1"
+else
+  DEFAULT_TS=$(($(date +%s) + 5 * 3600))
+  TS="$DEFAULT_TS"
+
+  # 查额度重置时间，看有没有比 now+5h 更早的重置点
+  _TOKEN=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null | \
+    python3 -c "import json,sys; print(json.load(sys.stdin)['claudeAiOauth']['accessToken'])" 2>/dev/null)
+  if [ -n "$_TOKEN" ]; then
+    _QUOTA_JSON=$(curl -s "https://api.anthropic.com/api/oauth/usage" \
+      -H "Authorization: Bearer $_TOKEN" 2>/dev/null)
+    _RESET_TS=$(echo "$_QUOTA_JSON" | python3 -c "
+import json, sys, datetime
+try:
+    d = json.load(sys.stdin)
+    candidates = []
+    for key in ('five_hour', 'seven_day'):
+        w = d.get(key) or {}
+        r = w.get('resets_at') or ''
+        if r:
+            dt = datetime.datetime.fromisoformat(r).astimezone()
+            candidates.append(int(dt.timestamp()))
+    if candidates: print(min(candidates))
+except: pass
+" 2>/dev/null)
+    # 如果重置时间存在且比 now+5h 更早，用 reset+60s
+    if [ -n "$_RESET_TS" ] && [ "$_RESET_TS" -lt "$DEFAULT_TS" ]; then
+      TS=$((_RESET_TS + 60))
+    fi
+  fi
+fi
+
+NEXT_HUMAN=$(date -r "$TS" '+%Y-%m-%d %H:%M:%S %Z')
+NEXT_M=$(date -r "$TS" '+%-m')
+NEXT_D=$(date -r "$TS" '+%-d')
+NEXT_H=$(date -r "$TS" '+%-H')
+NEXT_MIN=$(date -r "$TS" '+%-M')
+
+cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.leon.claude-resume</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$SCRIPT</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Month</key>
+        <integer>$NEXT_M</integer>
+        <key>Day</key>
+        <integer>$NEXT_D</integer>
+        <key>Hour</key>
+        <integer>$NEXT_H</integer>
+        <key>Minute</key>
+        <integer>$NEXT_MIN</integer>
+    </dict>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>$LOG</string>
+    <key>StandardErrorPath</key>
+    <string>$LOG</string>
+</dict>
+</plist>
+EOF
+
+launchctl unload "$PLIST" 2>/dev/null || true
+launchctl load "$PLIST" 2>/dev/null
+
+NOW_TS=$(date +%s)
+MINS_AWAY=$(( (TS - NOW_TS) / 60 ))
+echo "🔁 auto-resume scheduled: $NEXT_HUMAN (${MINS_AWAY}m后)"
