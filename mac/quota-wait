@@ -91,6 +91,14 @@ def watch_mode(threshold):
     def log(msg):
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         line = f"[{ts}] {msg}"
+        try:
+            if os.path.getsize(LOG) > 2 * 1024 * 1024:
+                with open(LOG) as f:
+                    lines = f.readlines()
+                with open(LOG, "w") as f:
+                    f.writelines(lines[-2000:])
+        except OSError:
+            pass
         with open(LOG, "a") as f:
             f.write(line + "\n")
         if sys.stdout.isatty():
@@ -130,6 +138,15 @@ def watch_mode(threshold):
             log(f"额度: " + "  ".join(
                 f"{'5h' if 'five' in n else '7d'}={u:.0f}%" for n, u, _ in windows
             ))
+
+            # 每次轮询更新续命调度时间
+            try:
+                subprocess.run(
+                    [os.path.expanduser("~/bin/schedule-next-resume")],
+                    capture_output=True, timeout=30
+                )
+            except Exception:
+                pass
 
             blocked = [(u, dt) for _, u, dt in windows if u >= threshold]
             if not blocked:

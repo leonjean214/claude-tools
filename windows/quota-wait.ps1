@@ -87,6 +87,12 @@ function Start-WatchMode($token) {
     }
     $PID | Out-File -FilePath $LockFile -Encoding ASCII
 
+    # Rotate log if > 2MB
+    if ((Test-Path $WatchLog) -and (Get-Item $WatchLog).Length -gt 2MB) {
+        $lines = Get-Content $WatchLog -Tail 2000
+        $lines | Set-Content $WatchLog -Encoding UTF8
+    }
+
     $Poll = 300
     Write-WatchLog "quota-watch started (PID=$PID, poll=${Poll}s)"
 
