@@ -1,128 +1,58 @@
-<#
-.SYNOPSIS
-    claude-resume - 自动续接被中断的 Claude 会话（Task Scheduler 触发）
+# Win Task Scheduler 自动恢复 wrapper (WSL claude)
+$ErrorActionPreference = "Continue"
 
-.DESCRIPTION
-    流程：
-      1. 写日志头
-      2. 查额度——100% 时调 schedule-next-resume.ps1 排到重置后再退
-      3. 读 $env:USERPROFILE\.claude-resume-dir 获取工作目录
-      4. 运行 claude -c -p "额度已重置，继续。" --max-turns 200 --permission-mode acceptEdits
-      5. 调 schedule-next-resume.ps1（无参数，自动选最优时间）
-#>
+$startTime = Get-Date
+$logPath = "$env:USERPROFILE\claude-resume.log"
 
-$ErrorActionPreference = "SilentlyContinue"   # 单步失败不中止整个脚本
+Add-Content -Path $logPath -Value ""
+Add-Content -Path $logPath -Value "============================================================"
+Add-Content -Path $logPath -Value "[$($startTime.ToString('yyyy-MM-dd HH:mm:ss'))] === Win Claude Resume START (WSL) ==="
 
-$Log      = "$env:USERPROFILE\claude-resume.log"
-$Schedule = "$env:USERPROFILE\bin\schedule-next-resume.ps1"
+# --- 额度检查：100% 时等到重置点 +1min 再跑 ---
+$shouldSkip = $false
+$waitUntil  = $null
+try {
+    $creds = Get-Content "$env:USERPROFILE\.claude\.credentials.json" | ConvertFrom-Json
+    $qToken = $creds.claudeAiOauth.accessToken
 
-function Write-Log($msg) {
-    $line = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $msg"
-    Write-Host $line
-    Add-Content -Path $Log -Value $line -Encoding UTF8
-}
+    $qResp = Invoke-RestMethod -Uri "https://api.anthropic.com/api/oauth/usage" `
+        -Headers @{ "Authorization" = "Bearer $qToken" } -ErrorAction Stop
 
-function Invoke-Schedule {
-    param([long]$At = 0)
-    $args_ = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $Schedule)
-    if ($At -gt 0) { $args_ += @("-At", "$At") }
-    & powershell.exe @args_
-}
+    $u5 = [float]($qResp.five_hour.utilization ?? 0)
+    $r5 = $qResp.five_hour.resets_at
+    $u7 = [float]($qResp.seven_day.utilization ?? 0)
+    $r7 = $qResp.seven_day.resets_at
 
-# ── Banner ──────────────────────────────────────────────────────────────────────
+    Add-Content -Path $logPath -Value "[$((Get-Date).ToString('HH:mm:ss'))] Quota: 5h=$([math]::Round($u5))% 7d=$([math]::Round($u7))%"
 
-$StartTs    = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-$StartHuman = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-
-Add-Content -Path $Log -Value "" -Encoding UTF8
-Write-Log "============================================================"
-Write-Log "=== Resume session START (id=$StartTs) ==="
-
-# ── Quota check ─────────────────────────────────────────────────────────────────
-
-function Get-Token {
-    $creds = Get-Content "$env:USERPROFILE\.claude\.credentials.json" -Raw | ConvertFrom-Json
-    return $creds.claudeAiOauth.accessToken
-}
-
-$token = $null
-try { $token = Get-Token } catch { Write-Log "Could not read credentials, skipping quota check." }
-
-# Retry once — credentials file may be mid-write after Claude Code refreshes token
-if (-not $token) {
-    Start-Sleep -Seconds 2
-    try { $token = Get-Token } catch {}
-}
-
-if ($token) {
-    $data = $null
-    try {
-        $data = Invoke-RestMethod -Uri "https://api.anthropic.com/api/oauth/usage" `
-            -Headers @{ "Authorization" = "Bearer $token" } -TimeoutSec 10
-    } catch {
-        # Re-read token once in case Claude Code rotated credentials mid-flight
-        try {
-            $token = Get-Token
-            $data  = Invoke-RestMethod -Uri "https://api.anthropic.com/api/oauth/usage" `
-                -Headers @{ "Authorization" = "Bearer $token" } -TimeoutSec 10
-        } catch {
-            Write-Log "Quota API failed ($_ ), proceeding without quota check."
-        }
+    if ($u5 -ge 100 -and $r5) {
+        $shouldSkip = $true
+        $waitUntil  = [DateTimeOffset]::Parse($r5).LocalDateTime.AddMinutes(1)
+    } elseif ($u7 -ge 100 -and $r7) {
+        $shouldSkip = $true
+        $waitUntil  = [DateTimeOffset]::Parse($r7).LocalDateTime.AddMinutes(1)
     }
-
-    if ($data) {
-        $windows = @()
-        foreach ($key in @("five_hour", "seven_day")) {
-            $w = $data.$key
-            if ($null -eq $w -or -not $w.resets_at) { continue }
-            $uRaw = $w.utilization
-            $u    = if ($null -ne $uRaw) { [float]$uRaw } else { 0.0 }
-            $dt   = [DateTimeOffset]::Parse($w.resets_at).LocalDateTime
-            $label = if ($key -like "*five*") { "5h" } else { "7d" }
-            $windows += [PSCustomObject]@{ Label = $label; Util = $u; ResetDt = $dt }
-        }
-
-        $summary = ($windows | ForEach-Object { "$($_.Label)=$([math]::Round($_.Util))%" }) -join "  "
-        Write-Log "Quota: $summary"
-
-        # Check if any window is at 100 %
-        $full = $windows | Where-Object { $_.Util -ge 100 }
-        if ($full) {
-            $earliest  = ($full | Sort-Object ResetDt | Select-Object -First 1).ResetDt
-            $waitTs    = [DateTimeOffset]::new($earliest).ToUnixTimeSeconds() + 60
-            $waitHuman = $earliest.AddSeconds(60).ToString("yyyy-MM-dd HH:mm:ss")
-            Write-Log "额度 100%，等到 $waitHuman 再跑"
-            Invoke-Schedule -At $waitTs
-            Write-Log "=== Session SKIPPED (quota full) - rescheduled $waitHuman ==="
-            exit 0
-        }
-    }
+} catch {
+    Add-Content -Path $logPath -Value "[$((Get-Date).ToString('HH:mm:ss'))] Quota check failed: $_ - proceeding"
 }
 
-# ── Determine working directory ─────────────────────────────────────────────────
-
-$ResumeDir = $null
-$DirFile   = "$env:USERPROFILE\.claude-resume-dir"
-if (Test-Path $DirFile) {
-    $ResumeDir = (Get-Content $DirFile -Raw).Trim()
+if ($shouldSkip) {
+    $waitStr = $waitUntil.ToString("yyyy-MM-dd HH:mm:ss")
+    Add-Content -Path $logPath -Value "[$((Get-Date).ToString('HH:mm:ss'))] 额度 100%，等到 $waitStr 再跑"
+    & "C:\Users\game5090\bin\schedule-next-resume.ps1" -At $waitStr 2>&1 | Add-Content -Path $logPath
+    Add-Content -Path $logPath -Value "=== Session SKIPPED (quota full) - rescheduled $waitStr ==="
+    exit 0
 }
-if (-not $ResumeDir -or -not (Test-Path $ResumeDir -PathType Container)) {
-    $ResumeDir = $env:USERPROFILE
-}
-Write-Log "续接目录: $ResumeDir"
-Set-Location $ResumeDir
+# --- 额度检查结束 ---
 
-# ── Run Claude ──────────────────────────────────────────────────────────────────
+# 用 WSL 里的 claude -c 续接上次 WSL 会话
+$claudeOut = & wsl.exe -d Ubuntu-24.04 -- claude -c -p "额度已重置，继续。" --max-turns 200 --dangerously-skip-permissions 2>&1
+$claudeOut | Add-Content -Path $logPath
 
-$claude = "claude"   # expected on PATH after `npm i -g @anthropic-ai/claude-code`
+$endTime = Get-Date
+$duration = ($endTime - $startTime).TotalSeconds
+Add-Content -Path $logPath -Value "[$($endTime.ToString('yyyy-MM-dd HH:mm:ss'))] === Win Claude Resume END (duration ${duration}s) ==="
 
-Write-Log "Launching: $claude -c -p '额度已重置，继续。' --max-turns 200 --permission-mode acceptEdits"
-& $claude -c -p "额度已重置，继续。" --max-turns 200 --permission-mode acceptEdits
-
-$EndTs    = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-$Duration = $EndTs - $StartTs
-Write-Log "=== Session end (duration ${Duration}s) ==="
-
-# ── Schedule next run ───────────────────────────────────────────────────────────
-
-Invoke-Schedule
+# 调度下次：查 API 取实际重置时间
+$schedOut = & "C:\Users\game5090\bin\schedule-next-resume.ps1" 2>&1
+$schedOut | Add-Content -Path $logPath
