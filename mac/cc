@@ -1,0 +1,39 @@
+#!/bin/bash
+# cc — claude with auto-quota-resume loop
+# Usage: cc [claude args...]  — same as `claude` but auto-resumes after quota reset
+#
+# After each exit, checks if quota ≥ 95%.
+# If yes: blocks until reset, then runs `claude -c` automatically.
+# If no:  assumes clean user exit and stops.
+# Ctrl+C during wait cancels the loop.
+
+CLAUDE=/Users/leonjean/.local/bin/claude
+QUOTA_WAIT="$HOME/bin/quota-wait"
+FIRST=true
+
+trap 'echo; echo "已取消。"; exit 0' INT
+
+while true; do
+    if $FIRST; then
+        "$CLAUDE" "$@"
+        FIRST=false
+    else
+        echo
+        echo "✅ 额度已重置，自动继续..."
+        "$CLAUDE" -c -p "额度已重置，继续。" --permission-mode acceptEdits
+    fi
+
+    # Non-blocking check: exit 0 = available (<threshold), exit 2 = blocked (≥threshold)
+    "$QUOTA_WAIT" --check --threshold 95
+    qstatus=$?
+
+    if [ $qstatus -eq 0 ]; then
+        break  # quota fine, user exited cleanly
+    elif [ $qstatus -eq 2 ]; then
+        echo
+        echo "⏳ 额度已满，等待重置后自动继续... (Ctrl+C 取消)"
+        "$QUOTA_WAIT" --threshold 95 || break
+    else
+        break  # quota-wait error
+    fi
+done

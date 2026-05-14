@@ -155,18 +155,33 @@ def watch_mode(threshold):
                         log(f"等待中… 还有 {int(remaining//60)}m{int(remaining%60):02d}s")
 
             # 如果 Claude Code 交互进程正在运行，让 UI 的 stop-and-wait 自己处理
+            # 用 TTY 判断：交互 session 有真实终端（s001 等），后台进程是 ??
+            interactive_running = False
             try:
-                ps = subprocess.run(["pgrep", "-lf", "claude"], capture_output=True, text=True)
-                interactive_running = any(
-                    ".local/bin/claude" in line
-                    and " -p " not in line
-                    and "--print" not in line
-                    and "quota-wait" not in line
-                    and "claude-resume" not in line
-                    for line in ps.stdout.splitlines()
-                )
+                pids = subprocess.run(
+                    ["pgrep", "-f", r"claude"],
+                    capture_output=True, text=True
+                ).stdout.strip().splitlines()
+                for pid_str in pids:
+                    pid = int(pid_str.strip())
+                    if pid == os.getpid(): continue
+                    tty = subprocess.run(
+                        ["ps", "-p", str(pid), "-o", "tty="],
+                        capture_output=True, text=True
+                    ).stdout.strip()
+                    args = subprocess.run(
+                        ["ps", "-p", str(pid), "-o", "args="],
+                        capture_output=True, text=True
+                    ).stdout.strip()
+                    if (tty and tty != "??"
+                            and " -p " not in args
+                            and "--print" not in args
+                            and "quota-wait" not in args
+                            and "claude-resume" not in args):
+                        interactive_running = True
+                        break
             except Exception:
-                interactive_running = False
+                pass
 
             if interactive_running:
                 log("检测到 Claude Code 交互进程运行中，跳过自动触发（UI stop-and-wait 会处理）。quota-watch 退出。")
@@ -191,6 +206,8 @@ def watch_mode(threshold):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--status", action="store_true")
+    parser.add_argument("--check", action="store_true",
+                        help="非阻塞检查：0=可用，2=已满，1=失败")
     parser.add_argument("--watch", action="store_true")
     parser.add_argument("--threshold", type=float, default=100)
     args = parser.parse_args()
@@ -212,6 +229,17 @@ def main():
         except Exception as e:
             print(f"❌ API 失败: {e}", file=sys.stderr)
             sys.exit(1)
+
+        if args.check:
+            blocked = [(u, dt) for _, u, dt in windows if u >= args.threshold]
+            if blocked:
+                max_u = max(u for u, _ in blocked)
+                print(f"⛔ 额度 {max_u:.0f}%（已满）")
+                sys.exit(2)
+            else:
+                max_u = max((u for _, u, _ in windows), default=0)
+                print(f"✅ 额度 {max_u:.0f}%（可用）")
+                sys.exit(0)
 
         print_status(windows)
         if args.status:
