@@ -41,6 +41,8 @@ Non-destructive and reversible (`-X DELETE` to unstar). No user confirmation nee
 | `windows/check-quota.ps1` | Windows | One-shot quota status display |
 | `mac/quota-wait` | macOS | Block until quota available; `--watch` daemon mode |
 | `windows/quota-wait.ps1` | Windows | Block until quota available; `-Watch` daemon mode |
+| `mac/schedule-next-resume` | macOS | Schedule launchd at exact quota reset time |
+| `mac/claude-resume.sh` | macOS | Auto-resume script: continues last conversation when quota refills |
 
 ---
 
@@ -90,7 +92,7 @@ Three modes:
 |---|---|
 | *(no args)* | If quota ≥ threshold, blocks until reset + 1 min, then exits 0 |
 | `--status` / `-Status` | Print current status and exit immediately |
-| `--watch` / `-Watch` | **Daemon mode**: runs in background, fires `claude-resume` when quota resets |
+| `--watch` / `-Watch` | **Daemon mode**: runs in background, fires `claude-resume.sh` when quota resets |
 
 `--watch` is the key mode for automation: launch it when your Claude session starts and it will automatically trigger the resume script the moment quota becomes available again — no manual intervention needed.
 
@@ -150,6 +152,102 @@ From the next session onwards it starts automatically.
 
 **Polling interval:** 300 s (5 min). Since `/api/oauth/usage` is a plain GET with no AI inference, it consumes **zero Claude quota**.
 
+**Interactive session detection:** When `--watch` reaches the reset time, it checks whether a Claude Code interactive process is already running. If one is found, it exits without firing `claude-resume.sh` — the UI's built-in "stop and wait" mechanism handles the resume instead.
+
+---
+
+### `schedule-next-resume` — Launchd scheduler (macOS)
+
+Updates the launchd one-shot timer to fire at the optimal next time:
+
+- Reads live reset times from `/api/oauth/usage`
+- Schedules at **`min(earliest_reset + 1 min, now + 5 h)`**
+- Prints the scheduled time to stdout so it appears in the session start banner
+
+```
+🔁 auto-resume scheduled: 2026-05-14 16:31:00 EDT (52m后)
+```
+
+```bash
+cp mac/schedule-next-resume ~/bin/schedule-next-resume && chmod +x ~/bin/schedule-next-resume
+
+schedule-next-resume              # auto-pick optimal time
+schedule-next-resume 1747260000   # explicit Unix timestamp
+```
+
+Wire it into `SessionStart` so every session (manual or auto) re-anchors the timer:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{"hooks": [
+      {"type": "command", "command": "~/bin/schedule-next-resume 2>&1 || true"}
+    ]}]
+  }
+}
+```
+
+**Prerequisite:** a launchd plist at `~/Library/LaunchAgents/com.leon.claude-resume.plist` pointing to `~/bin/claude-resume.sh`. The script creates/overwrites this plist on every call.
+
+---
+
+### `claude-resume.sh` — Auto-resume script (macOS)
+
+Triggered automatically by launchd or `quota-wait --watch`. Continues the last interrupted conversation without any manual input.
+
+**What it does:**
+
+1. Checks quota — if still 100%, reschedules via `schedule-next-resume` and exits
+2. Reads `~/.claude-resume-dir` (saved by the `Stop` hook) to find the last session's working directory
+3. Runs `claude --continue -p "额度已重置，继续。"` from that directory — resumes the exact conversation that was interrupted
+4. On exit, calls `schedule-next-resume` to chain the next fire
+
+```bash
+cp mac/claude-resume.sh ~/bin/claude-resume.sh && chmod +x ~/bin/claude-resume.sh
+```
+
+Logs to `~/claude-resume.log`.
+
+**Full setup — complete `settings.json`:**
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{"hooks": [
+      {"type": "command", "command": "~/bin/check-quota 2>/dev/null || true"},
+      {"type": "command", "command": "~/bin/schedule-next-resume 2>&1 || true"},
+      {"type": "command", "command": "nohup ~/bin/quota-wait --watch >> ~/quota-watch.log 2>&1 &"}
+    ]}],
+    "Stop": [{"hooks": [
+      {"type": "command", "command": "echo \"$(pwd)\" > ~/.claude-resume-dir 2>/dev/null || true"}
+    ]}]
+  }
+}
+```
+
+The `Stop` hook saves the current working directory so `claude-resume.sh` can resume from the right place.
+
+**How the chain works:**
+
+```
+Session starts
+  └─ SessionStart hook
+       ├─ check-quota          → show current usage
+       ├─ schedule-next-resume → set launchd timer to reset_time+1min
+       └─ quota-wait --watch & → background daemon
+
+Quota exhausted mid-session
+  ├─ (interactive) UI shows "stop and wait" → quota-wait exits, UI handles it
+  └─ (unattended)  quota-wait waits for reset, then fires claude-resume.sh
+
+Session ends
+  └─ Stop hook → saves working directory to ~/.claude-resume-dir
+
+launchd fires claude-resume.sh at reset_time+1min
+  ├─ quota still full? → reschedule + exit
+  └─ quota available  → claude --continue from saved dir → chain repeats
+```
+
 ---
 
 ## 中文
@@ -162,6 +260,8 @@ From the next session onwards it starts automatically.
 | `windows/check-quota.ps1` | Windows | 一键查看当前额度 |
 | `mac/quota-wait` | macOS | 阻塞等待额度可用；`--watch` 守护模式 |
 | `windows/quota-wait.ps1` | Windows | 阻塞等待额度可用；`-Watch` 守护模式 |
+| `mac/schedule-next-resume` | macOS | 按额度重置时间精确调度 launchd |
+| `mac/claude-resume.sh` | macOS | 自动续命：额度恢复时续接上次对话 |
 
 ---
 
@@ -205,7 +305,7 @@ powershell -ExecutionPolicy Bypass -File $env:USERPROFILE\bin\check-quota.ps1
 |---|---|
 | *(无参数)* | 额度 ≥ 阈值时阻塞，等到重置 +1min 后退出 |
 | `--status` / `-Status` | 打印状态后立即退出 |
-| `--watch` / `-Watch` | **守护模式**：后台运行，额度重置时自动触发 `claude-resume` |
+| `--watch` / `-Watch` | **守护模式**：后台运行，额度重置时自动触发 `claude-resume.sh` |
 
 `--watch` 是自动化的核心：在 Claude session 启动时拉起它，额度一恢复就自动续命，无需人工干预。
 
@@ -258,6 +358,102 @@ Start-Process powershell -ArgumentList '-NoProfile -ExecutionPolicy Bypass -File
 
 **轮询间隔：** 300 秒（5 分钟）。`/api/oauth/usage` 是纯 GET 查询，无 AI 推理，**零额度消耗**。
 
+**交互 session 检测：** `--watch` 到达重置时间后，会先检查当前是否有 Claude Code 交互进程在运行。若有，则直接退出，由 UI 内置的"stop and wait"处理续命，避免两个进程竞争同一个对话。
+
+---
+
+### `schedule-next-resume` — launchd 调度器（macOS）
+
+将 launchd 一次性触发器设置到最优下次续命时间：
+
+- 实时读取 `/api/oauth/usage` 的重置时间
+- 取 **`min(最近重置点 + 1min, now + 5h)`** 作为下次触发时间
+- 将调度时间打印到 stdout，在 session 启动横幅中可见
+
+```
+🔁 auto-resume scheduled: 2026-05-14 16:31:00 EDT (52m后)
+```
+
+```bash
+cp mac/schedule-next-resume ~/bin/schedule-next-resume && chmod +x ~/bin/schedule-next-resume
+
+schedule-next-resume              # 自动选最优时间
+schedule-next-resume 1747260000   # 指定 Unix 时间戳
+```
+
+加入 `SessionStart` hook，每次 session 自动重置定时器：
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{"hooks": [
+      {"type": "command", "command": "~/bin/schedule-next-resume 2>&1 || true"}
+    ]}]
+  }
+}
+```
+
+**前提条件：** `~/Library/LaunchAgents/com.leon.claude-resume.plist` 指向 `~/bin/claude-resume.sh`。脚本每次调用时会自动创建/覆盖该 plist。
+
+---
+
+### `claude-resume.sh` — 自动续命脚本（macOS）
+
+由 launchd 或 `quota-wait --watch` 自动触发，无需人工干预即可续接上次被中断的对话。
+
+**执行流程：**
+
+1. 检查额度 — 若仍为 100%，调用 `schedule-next-resume` 重新排期后退出
+2. 读取 `~/.claude-resume-dir`（由 `Stop` hook 保存）获取上次 session 的工作目录
+3. 在该目录执行 `claude --continue -p "额度已重置，继续。"` — 精确续接被中断的对话
+4. 退出时调用 `schedule-next-resume` 为下一棒排期，形成自我延续链
+
+```bash
+cp mac/claude-resume.sh ~/bin/claude-resume.sh && chmod +x ~/bin/claude-resume.sh
+```
+
+日志写入 `~/claude-resume.log`。
+
+**完整配置 — `settings.json`：**
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{"hooks": [
+      {"type": "command", "command": "~/bin/check-quota 2>/dev/null || true"},
+      {"type": "command", "command": "~/bin/schedule-next-resume 2>&1 || true"},
+      {"type": "command", "command": "nohup ~/bin/quota-wait --watch >> ~/quota-watch.log 2>&1 &"}
+    ]}],
+    "Stop": [{"hooks": [
+      {"type": "command", "command": "echo \"$(pwd)\" > ~/.claude-resume-dir 2>/dev/null || true"}
+    ]}]
+  }
+}
+```
+
+`Stop` hook 保存当前工作目录，供 `claude-resume.sh` 在正确的目录续接对话。
+
+**完整工作链：**
+
+```
+Session 启动
+  └─ SessionStart hook
+       ├─ check-quota          → 显示当前用量
+       ├─ schedule-next-resume → 按重置时间设 launchd 定时器
+       └─ quota-wait --watch & → 启动后台守护进程
+
+Session 中额度耗尽
+  ├─ （用户在场）UI 显示"stop and wait" → quota-wait 退出，UI 自行处理
+  └─ （无人值守）quota-wait 等到重置时间，触发 claude-resume.sh
+
+Session 结束
+  └─ Stop hook → 保存工作目录到 ~/.claude-resume-dir
+
+launchd 在 重置时间+1min 触发 claude-resume.sh
+  ├─ 额度仍满？→ 重新排期 + 退出
+  └─ 额度可用 → 从保存的目录执行 claude --continue → 链条继续
+```
+
 ---
 
 ## Français
@@ -270,6 +466,8 @@ Start-Process powershell -ArgumentList '-NoProfile -ExecutionPolicy Bypass -File
 | `windows/check-quota.ps1` | Windows | Affichage ponctuel du quota |
 | `mac/quota-wait` | macOS | Attente bloquante ; mode démon `--watch` |
 | `windows/quota-wait.ps1` | Windows | Attente bloquante ; mode démon `-Watch` |
+| `mac/schedule-next-resume` | macOS | Planifie launchd à l'heure exacte de réinitialisation |
+| `mac/claude-resume.sh` | macOS | Reprise automatique : continue la dernière conversation au reset |
 
 ---
 
@@ -299,7 +497,7 @@ Trois modes :
 |---|---|
 | *(sans argument)* | Bloque jusqu'à reset + 1 min si quota ≥ seuil |
 | `--status` / `-Status` | Affiche le statut et quitte immédiatement |
-| `--watch` / `-Watch` | **Mode démon** : surveille en arrière-plan, déclenche `claude-resume` au reset |
+| `--watch` / `-Watch` | **Mode démon** : surveille en arrière-plan, déclenche `claude-resume.sh` au reset |
 
 **Lancement automatique avec Claude Code** — ajoutez au hook `SessionStart` :
 
@@ -327,6 +525,60 @@ Start-Process powershell -ArgumentList '-NoProfile -ExecutionPolicy Bypass -File
 Dès la session suivante, le démarrage est automatique.
 
 Intervalle de scrutation : **300 s**. Consommation de quota Claude : **zéro**.
+
+**Détection de session interactive :** Quand `--watch` atteint l'heure de réinitialisation, il vérifie si un processus Claude Code interactif est en cours. Si oui, il quitte sans déclencher `claude-resume.sh` — le mécanisme "stop and wait" intégré à l'interface prend le relais.
+
+---
+
+### `schedule-next-resume` — Planificateur launchd (macOS)
+
+Met à jour le timer launchd one-shot au moment optimal :
+
+- Lit les heures de réinitialisation en direct depuis `/api/oauth/usage`
+- Planifie à **`min(reset + 1 min, maintenant + 5 h)`**
+- Affiche l'heure planifiée dans la bannière de démarrage de session
+
+```
+🔁 auto-resume scheduled: 2026-05-14 16:31:00 EDT (52m后)
+```
+
+```bash
+cp mac/schedule-next-resume ~/bin/schedule-next-resume && chmod +x ~/bin/schedule-next-resume
+```
+
+---
+
+### `claude-resume.sh` — Script de reprise automatique (macOS)
+
+Déclenché par launchd ou `quota-wait --watch`. Continue automatiquement la dernière conversation interrompue.
+
+**Ce qu'il fait :**
+
+1. Vérifie le quota — si encore 100%, replanifie via `schedule-next-resume` et quitte
+2. Lit `~/.claude-resume-dir` (sauvegardé par le hook `Stop`) pour retrouver le répertoire de la dernière session
+3. Exécute `claude --continue -p "额度已重置，继续。"` depuis ce répertoire — reprend exactement la conversation interrompue
+4. À la sortie, appelle `schedule-next-resume` pour enchaîner le prochain déclenchement
+
+```bash
+cp mac/claude-resume.sh ~/bin/claude-resume.sh && chmod +x ~/bin/claude-resume.sh
+```
+
+**Configuration complète — `settings.json` :**
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{"hooks": [
+      {"type": "command", "command": "~/bin/check-quota 2>/dev/null || true"},
+      {"type": "command", "command": "~/bin/schedule-next-resume 2>&1 || true"},
+      {"type": "command", "command": "nohup ~/bin/quota-wait --watch >> ~/quota-watch.log 2>&1 &"}
+    ]}],
+    "Stop": [{"hooks": [
+      {"type": "command", "command": "echo \"$(pwd)\" > ~/.claude-resume-dir 2>/dev/null || true"}
+    ]}]
+  }
+}
+```
 
 ---
 
