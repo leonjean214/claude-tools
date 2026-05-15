@@ -1,0 +1,262 @@
+#!/usr/bin/env bash
+# chat — 多模型群聊：共享会话历史，任意模型可接力
+#
+# 用法:
+#   chat "消息"                    自动路由
+#   chat -m code "消息"            强制模型 (code/reason/smart/default)
+#   chat -s 项目名 "消息"           指定会话（默认 default）
+#   chat --show [-s 名]            显示会话历史
+#   chat --new  [-s 名]            清空会话
+#   chat --list                    列出所有会话
+#
+# 环境自动检测:
+#   WSL  → 直连 localhost:11434（Ollama on Win）
+#   Mac  → SSH + SCP → Win oc-chat.ps1
+
+# ── 环境检测 ──────────────────────────────────────────────────────
+if grep -qi microsoft /proc/version 2>/dev/null; then
+    MODE="wsl"
+    OLLAMA="http://localhost:11434"
+else
+    MODE="mac"
+fi
+
+# ── Mac SSH 配置 ──────────────────────────────────────────────────
+SSH_HOST="game5090@100.98.245.123"
+SSH_KEY="$HOME/.ssh/id_ed25519"
+SSH_OPTS="-i $SSH_KEY -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=no"
+WIN_CHAT='C:\Users\game5090\bin\oc-chat.ps1'
+
+# ── 模型路由表 ─────────────────────────────────────────────────────
+SESSIONS_DIR="$HOME/.chat_sessions"
+SESSION="default"
+MODEL=""
+MAX_TURNS=15
+
+mkdir -p "$SESSIONS_DIR"
+
+# ── 参数解析 ──────────────────────────────────────────────────────
+ACTION=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -m|--model)   MODEL="$2"; shift 2 ;;
+        -s|--session) SESSION="$2"; shift 2 ;;
+        --show)       ACTION="show"; shift ;;
+        --new)        ACTION="new";  shift ;;
+        --list)       ACTION="list"; shift ;;
+        --)           shift; break ;;
+        -*)           echo "未知参数: $1" >&2; exit 1 ;;
+        *)            break ;;
+    esac
+done
+
+SESSION_FILE="$SESSIONS_DIR/${SESSION}.jsonl"
+
+# ── 辅助操作 ──────────────────────────────────────────────────────
+if [[ "$ACTION" == "list" ]]; then
+    echo "=== 会话列表 ==="
+    found=0
+    for f in "$SESSIONS_DIR"/*.jsonl; do
+        [[ -f "$f" ]] || continue
+        found=1
+        name=$(basename "$f" .jsonl)
+        turns=$(( $(wc -l < "$f") / 2 ))
+        printf '  %-20s %d 轮\n' "$name" "$turns"
+    done
+    [[ $found -eq 0 ]] && echo "  (空)"
+    exit 0
+fi
+
+if [[ "$ACTION" == "new" ]]; then
+    rm -f "$SESSION_FILE"
+    echo "会话 '$SESSION' 已清空"
+    exit 0
+fi
+
+if [[ "$ACTION" == "show" ]]; then
+    if [[ ! -f "$SESSION_FILE" ]]; then echo "会话 '$SESSION' 为空"; exit 0; fi
+    echo "=== 会话: $SESSION ==="
+    python3 - "$SESSION_FILE" <<'PYEOF'
+import sys, json
+with open(sys.argv[1], encoding='utf-8') as f:
+    for line in f:
+        line = line.strip()
+        if not line: continue
+        d = json.loads(line)
+        role, content = d['role'], d['content']
+        model = d.get('model') or 'assistant'
+        preview = content[:300] + ('…' if len(content) > 300 else '')
+        if role == 'user':
+            print(f'\033[36m[你]\033[0m {preview}\n')
+        else:
+            print(f'\033[33m[{model}]\033[0m {preview}\n')
+PYEOF
+    exit 0
+fi
+
+# ── 读取 prompt ────────────────────────────────────────────────────
+PROMPT="${*:-$(cat)}"
+[[ -z "$PROMPT" ]] && { echo "用法: chat \"消息\"" >&2; exit 1; }
+
+# ── 搜索长期记忆 ───────────────────────────────────────────────────
+MEMORY_CONTEXT=""
+MEMORY_SCRIPT="$(dirname "$0")/chat_memory.py"
+if [[ -f "$MEMORY_SCRIPT" ]]; then
+    MEM_FACTS=$(python3 "$MEMORY_SCRIPT" search "$PROMPT" 2>/dev/null)
+    if [[ -n "$MEM_FACTS" && "$MEM_FACTS" != "[]" ]]; then
+        MEMORY_CONTEXT=$(python3 -c "
+import json, sys
+facts = json.loads(sys.argv[1])
+if facts:
+    print('Relevant background from long-term memory:\n' + '\n'.join('- ' + f for f in facts))
+" "$MEM_FACTS" 2>/dev/null)
+        [[ -n "$MEMORY_CONTEXT" ]] && printf '\033[2m[memory] %d 条相关记忆\033[0m\n' "$(echo "$MEM_FACTS" | python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null)" >&2
+    fi
+fi
+
+# ── 构建 messages JSON（含历史 + 可选 system 记忆） ────────────────
+MESSAGES_JSON=$(python3 - "$SESSION_FILE" "$MAX_TURNS" "$PROMPT" "$MEMORY_CONTEXT" <<'PYEOF'
+import sys, json, os
+sf, max_turns, prompt, memory_ctx = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+messages = []
+# 注入长期记忆为 system 消息
+if memory_ctx.strip():
+    messages.append({"role": "system", "content": memory_ctx})
+if os.path.exists(sf):
+    with open(sf, encoding='utf-8') as f:
+        lines = [l.strip() for l in f if l.strip()]
+    for line in lines[-(max_turns * 2):]:
+        d = json.loads(line)
+        messages.append({"role": d["role"], "content": d["content"]})
+messages.append({"role": "user", "content": prompt})
+print(json.dumps(messages, ensure_ascii=False))
+PYEOF
+)
+
+[[ -z "$MESSAGES_JSON" ]] && { echo "[chat] messages 构建失败" >&2; exit 1; }
+
+# ── WSL 模式：直连 Ollama ──────────────────────────────────────────
+if [[ "$MODE" == "wsl" ]]; then
+    # 分类（用 gemma4）
+    CATEGORY="${MODEL:-}"
+    if [[ -z "$CATEGORY" ]]; then
+        CLASS_PROMPT="Reply with exactly one word. Categories: code (writing/debugging/reviewing code, scripts, SQL, regex), reason (math, logic, step-by-step analysis, proofs, deep thinking), smart (system/architecture design, research, long-form writing, multi-topic), default (facts, translation, casual chat, quick Q&A). Query: $PROMPT"
+        RAW_CAT=$(curl -sf --max-time 10 "$OLLAMA/api/generate" \
+            -H "Content-Type: application/json" \
+            -d "{\"model\":\"gemma4\",\"prompt\":$(python3 -c "import json,sys; print(json.dumps(sys.argv[1]))" "$CLASS_PROMPT"),\"stream\":false}" \
+            2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('response','').strip().lower().split()[0])" 2>/dev/null)
+        case "$RAW_CAT" in
+            code|reason|smart) CATEGORY="$RAW_CAT" ;;
+            *) CATEGORY="default" ;;
+        esac
+    fi
+
+    # 直接模型名（含 :）透传
+    if [[ "$CATEGORY" == *:* ]]; then
+        OLLAMA_MODEL="$CATEGORY"
+    else
+        case "$CATEGORY" in
+            code)   OLLAMA_MODEL="qwen2.5-coder:32b" ;;
+            reason) OLLAMA_MODEL="qwq:32b" ;;
+            smart)  OLLAMA_MODEL="llama4:scout" ;;
+            llama)  OLLAMA_MODEL="llama3.3:70b" ;;
+            phi)    OLLAMA_MODEL="phi4:14b" ;;
+            gemma3) OLLAMA_MODEL="gemma3:27b" ;;
+            qwen3)  OLLAMA_MODEL="qwen3:30b-a3b" ;;
+            fast)   OLLAMA_MODEL="qwen2.5:3b" ;;
+            gemma4) OLLAMA_MODEL="gemma4" ;;
+            *)      OLLAMA_MODEL="gemma4" ;;
+        esac
+    fi
+
+    printf '\033[2m[WSL | %s | 会话: %s]\033[0m\n' "$OLLAMA_MODEL" "$SESSION" >&2
+
+    RESPONSE=$(curl -sf --max-time 600 "$OLLAMA/api/chat" \
+        -H "Content-Type: application/json" \
+        -d "{\"model\":\"$OLLAMA_MODEL\",\"messages\":$MESSAGES_JSON,\"stream\":false}" \
+        2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['message']['content'])" 2>/dev/null)
+
+    if [[ -z "$RESPONSE" ]]; then
+        echo "[chat] Ollama 无响应" >&2; exit 1
+    fi
+    USED_MODEL="$OLLAMA_MODEL"
+
+# ── Mac 模式：SSH + SCP → oc-chat.ps1 ─────────────────────────────
+else
+    TMP_LOCAL=$(mktemp /tmp/chat_XXXXXX.json)
+    printf '%s' "$MESSAGES_JSON" > "$TMP_LOCAL"
+
+    WIN_TMP_NAME="chat_$$.json"
+    WIN_TMP_PS="C:\\Users\\game5090\\AppData\\Local\\Temp\\$WIN_TMP_NAME"
+    WIN_TMP_SCP="C:/Users/game5090/AppData/Local/Temp/$WIN_TMP_NAME"
+
+    scp $SSH_OPTS "$TMP_LOCAL" "${SSH_HOST}:${WIN_TMP_SCP}" 2>/dev/null
+    SCP_RC=$?
+    rm -f "$TMP_LOCAL"
+
+    if [[ $SCP_RC -ne 0 ]]; then
+        echo "[chat] SCP 失败，fallback → ask" >&2
+        exec ask ${MODEL:+-m "$MODEL"} "$PROMPT"
+    fi
+
+    PS_ARGS="-NoProfile -NonInteractive -File \"$WIN_CHAT\" -MessagesFile \"$WIN_TMP_PS\""
+    [[ -n "$MODEL" ]] && PS_ARGS="$PS_ARGS -Model $MODEL"
+
+    printf '\033[2m[Mac→Win | 会话: %s]\033[0m\n' "$SESSION" >&2
+
+    RAW=$(ssh $SSH_OPTS "$SSH_HOST" "powershell $PS_ARGS" 2>/dev/null)
+    RC=$?
+
+    ssh $SSH_OPTS "$SSH_HOST" \
+        "powershell -Command \"Remove-Item -Force '$WIN_TMP_PS' -ErrorAction SilentlyContinue\"" \
+        2>/dev/null &
+
+    if [[ $RC -eq 42 ]]; then
+        printf '\033[2m[chat] route → claude\033[0m\n' >&2
+        RESPONSE=$(claude --bare -p "$PROMPT" 2>/dev/null)
+        USED_MODEL="claude"
+    elif [[ $RC -ne 0 || -z "$RAW" ]]; then
+        echo "[chat] 失败 (exit $RC)，fallback → ask" >&2
+        exec ask ${MODEL:+-m "$MODEL"} "$PROMPT"
+    else
+        USED_MODEL=$(printf '%s' "$RAW" | head -1 | sed 's/^\[used_model\] //')
+        RESPONSE=$(printf '%s' "$RAW" | tail -n +2)
+    fi
+
+    [[ -z "$RESPONSE" ]] && { echo "[chat] 空响应" >&2; exit 1; }
+fi
+
+# ── 输出 ──────────────────────────────────────────────────────────
+printf '\033[33m[%s]\033[0m\n%s\n' "${USED_MODEL:-assistant}" "$RESPONSE"
+
+# ── 追加历史 ──────────────────────────────────────────────────────
+python3 - "$SESSION_FILE" "$PROMPT" "$RESPONSE" "${USED_MODEL:-assistant}" <<'PYEOF'
+import sys, json
+from datetime import datetime
+sf, prompt, response, model = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+ts = datetime.now().isoformat(timespec='seconds')
+with open(sf, 'a', encoding='utf-8') as f:
+    f.write(json.dumps({"role": "user",      "content": prompt,   "model": None,  "ts": ts}, ensure_ascii=False) + '\n')
+    f.write(json.dumps({"role": "assistant", "content": response, "model": model, "ts": ts}, ensure_ascii=False) + '\n')
+PYEOF
+
+# ── 后台提取事实到长期记忆 ──────────────────────────────────────────
+if [[ -f "$MEMORY_SCRIPT" ]]; then
+    if [[ "$MODE" == "wsl" ]]; then
+        # WSL：直接用本地 Ollama 提取
+        python3 "$MEMORY_SCRIPT" extract "$OLLAMA" "$PROMPT" "$RESPONSE" "$SESSION" 2>/dev/null &
+    else
+        # Mac：写 prompt 为原始记忆条目（无 LLM 提取，避免 SSH 引号地狱）
+        python3 - "$PROMPT" "$SESSION" <<'PYEOF' 2>/dev/null &
+import sys, json
+from datetime import datetime
+from pathlib import Path
+prompt, session = sys.argv[1], sys.argv[2]
+mf = Path.home() / ".chat_memory" / "facts.jsonl"
+mf.parent.mkdir(exist_ok=True)
+entry = {"fact": prompt[:200], "session": session, "ts": datetime.now().isoformat(timespec="seconds")}
+with open(mf, "a", encoding="utf-8") as f:
+    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+PYEOF
+    fi
+fi
