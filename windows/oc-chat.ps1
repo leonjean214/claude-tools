@@ -25,11 +25,11 @@ if (-not $lastUserMsg) {
 }
 
 # ── 分类 ────────────────────────────────────────────────────────────
-$knownCategories = @("code","reason","smart","llama","phi","gemma3","qwen3","fast","default")
+$knownCategories = @("code","reason","smart","llama","phi","gemma3","qwen3","fast","claude","default")
 
 $category = "default"
 if (-not $Model) {
-    $classPrompt = "Reply with exactly one word only. Categories: code (writing/debugging/reviewing code, scripts, SQL, regex), reason (math, logic, step-by-step analysis, proofs, deep thinking), smart (system/architecture design, research, long-form writing, multi-topic), default (facts, translation, casual chat, quick Q&A). Query: " + $lastUserMsg
+    $classPrompt = "Reply with exactly one word only. Categories: code (writing/debugging/reviewing code, scripts, SQL, regex), reason (math, logic, step-by-step analysis, proofs, deep thinking), smart (system/architecture design, research, long-form writing, multi-topic), claude (needs file access/web browsing/shell commands/real-time info), default (facts, translation, casual chat, quick Q&A). Query: " + $lastUserMsg
     $classBody = @{ model = "gemma4"; prompt = $classPrompt; stream = $false } | ConvertTo-Json -Depth 3
     try {
         $cr = Invoke-RestMethod -Uri "$OLLAMA/api/generate" -Method Post `
@@ -43,6 +43,8 @@ if (-not $Model) {
 } else {
     $category = $Model.ToLower()
 }
+
+if ($category -eq "claude") { exit 42 }
 
 
 # ── 路由 ────────────────────────────────────────────────────────────
