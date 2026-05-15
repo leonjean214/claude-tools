@@ -211,13 +211,8 @@ else
         "powershell -Command \"Remove-Item -Force '$WIN_TMP_PS' -ErrorAction SilentlyContinue\"" \
         2>/dev/null &
 
-    if [[ $RC -eq 42 ]]; then
-        printf '\033[2m[chat] route → claude\033[0m\n' >&2
-        RESPONSE=$(claude --bare -p "$PROMPT" 2>/dev/null)
-        USED_MODEL="claude"
-    elif [[ $RC -ne 0 || -z "$RAW" ]]; then
-        echo "[chat] 失败 (exit $RC)，fallback → ask" >&2
-        exec ask ${MODEL:+-m "$MODEL"} "$PROMPT"
+    if [[ $RC -ne 0 || -z "$RAW" ]]; then
+        echo "[chat] 失败 (exit $RC)" >&2; exit 1
     else
         USED_MODEL=$(printf '%s' "$RAW" | head -1 | sed 's/^\[used_model\] //')
         RESPONSE=$(printf '%s' "$RAW" | tail -n +2)
