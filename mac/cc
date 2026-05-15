@@ -1,39 +1,60 @@
 #!/bin/bash
 # cc — claude with auto-quota-resume loop
-# Usage: cc [claude args...]  — same as `claude` but auto-resumes after quota reset
-#
-# After each exit, checks if quota ≥ 95%.
-# If yes: blocks until reset, then runs `claude -c` automatically.
-# If no:  assumes clean user exit and stops.
-# Ctrl+C during wait cancels the loop.
+# 额度满时 Claude Code 会 stop-and-wait；本脚本在 tmux 里运行，
+# 额度重置后自动往当前 pane 注入 Enter 解除等待，无需人工干预。
 
 CLAUDE=/Users/leonjean/.local/bin/claude
 QUOTA_WAIT="$HOME/bin/quota-wait"
+
+# 若不在 tmux 中，自动进入（同名 session 则 attach，避免重复开窗口）
+if [ -z "$TMUX" ]; then
+    exec tmux new-session -A -s "cc-main" -- "$0" "$@"
+fi
+
+PANE=$(tmux display-message -p "#{pane_id}")
 FIRST=true
 
-trap 'echo; echo "已取消。"; exit 0' INT
+# 后台守护：监控额度，重置后向当前 pane 注入 Enter 解除 stop-and-wait
+_quota_watcher() {
+    while true; do
+        "$QUOTA_WAIT" --check --threshold 95 >/dev/null 2>&1
+        if [ $? -eq 2 ]; then
+            # 额度已满，阻塞等到重置点
+            "$QUOTA_WAIT" --threshold 95 >/dev/null 2>&1
+            sleep 2  # 重置后稍等 API 生效
+            # 注入 Enter 解除 Claude Code 的 stop-and-wait
+            tmux send-keys -t "$PANE" "" Enter 2>/dev/null
+            printf '\r\033[2m[cc] 额度已重置，已自动注入继续\033[0m\n' >/dev/tty 2>/dev/null || true
+        fi
+        sleep 30
+    done
+}
+
+trap 'kill "$WATCHER_PID" 2>/dev/null; printf "\n已取消。\n"; exit 0' INT
+trap 'kill "$WATCHER_PID" 2>/dev/null' EXIT
+
+_quota_watcher &
+WATCHER_PID=$!
 
 while true; do
     if $FIRST; then
         "$CLAUDE" "$@"
         FIRST=false
     else
-        echo
-        echo "✅ 额度已重置，自动继续..."
-        "$CLAUDE" -c -p "额度已重置，继续。" --permission-mode acceptEdits
+        printf '\n\033[32m✅ 额度已重置，自动继续...\033[0m\n'
+        "$CLAUDE" -c --permission-mode acceptEdits
     fi
 
-    # Non-blocking check: exit 0 = available (<threshold), exit 2 = blocked (≥threshold)
-    "$QUOTA_WAIT" --check --threshold 95
+    # claude 已退出，检查是否因额度耗尽
+    "$QUOTA_WAIT" --check --threshold 95 2>/dev/null
     qstatus=$?
 
     if [ $qstatus -eq 0 ]; then
-        break  # quota fine, user exited cleanly
+        break  # 额度充足，用户正常退出
     elif [ $qstatus -eq 2 ]; then
-        echo
-        echo "⏳ 额度已满，等待重置后自动继续... (Ctrl+C 取消)"
+        printf '\n\033[33m⏳ 额度已满，等待重置后自动继续... (Ctrl+C 取消)\033[0m\n'
         "$QUOTA_WAIT" --threshold 95 || break
     else
-        break  # quota-wait error
+        break
     fi
 done
