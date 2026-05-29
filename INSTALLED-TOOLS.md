@@ -26,6 +26,14 @@
 
 - `codegraph` — 唯一配置的 MCP server(代码图谱:callers / callees / impact / search / context / node / files / status)
 
+## 2.5 spec-kit(GitHub Spec-Driven Development,2026-05-29 装)
+
+- **CLI**:`specify`(via `uv tool install specify-cli`,装在 `~/.local/bin/specify`;`uv` 由 brew 装)
+- **全局 skills**:14 个 `speckit-*` SKILL 复制到 `~/.claude/skills/`,每个 cc 会话都能看到 `/speckit-specify` `/speckit-plan` `/speckit-tasks` `/speckit-implement` `/speckit-constitution` `/speckit-clarify` `/speckit-analyze` `/speckit-checklist` 等
+- **依赖**:skills 需项目里有 `.specify/` 目录才能工作(规格驱动是项目级的)
+- **自动化**:`cc` 脚本进入 git 项目时,若无 `.specify/` 会提示 `[y/N]` 是否 `specify init --here --ai claude --force`;init 前自动备份现有 `CLAUDE.md`;home 目录绝不 init
+- **工作流**:`/speckit-constitution` → `/speckit-specify` → `/speckit-plan` → `/speckit-tasks` → `/speckit-implement`
+
 ## 3. Hooks(`~/.claude/settings.json`)
 
 **SessionStart:**
@@ -66,7 +74,7 @@
 
 ## 5. 未安装 / 占位
 
-- `~/.claude/skills/` 目录不存在 —— 仅使用内置 skills
+- `~/.claude/skills/` 现有 14 个 spec-kit `speckit-*` skill(见 2.5),无其他自定义 skill
 - `~/.claude/plugins/` 仅 marketplace 占位,无第三方插件
 
 ---
