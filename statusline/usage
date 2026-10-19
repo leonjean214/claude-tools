@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from bisect import bisect_left
 import glob
 import json
 import os
@@ -43,6 +44,8 @@ WINDOWS = {
 # 超过 272K 输入 token 的请求整单按 tiers 价计。
 PI_MODELS_STORE = HOME / ".pi" / "agent" / "models-store.json"
 PI_SESSIONS = HOME / ".pi" / "agent" / "sessions"
+PI_ARCHIVE = HOME / ".pi-conversation-archive"
+PI_USAGE_LEDGER = Path(os.environ.get("PI_USAGE_LEDGER_DIR", HOME / ".pi" / "agent" / "usage-ledger"))
 OPENAI_TIER_THRESHOLD = 272_000
 OPENAI_PRICES_FALLBACK = {
     "gpt-6-astra": {"input": 10, "output": 50, "cacheRead": 1, "cacheWrite": 12.5,
@@ -526,9 +529,6 @@ def claude_costs() -> UsageCost:
     records: list[list[Any]] = []
     seen_paths: set[str] = set()
 
-    if not CLAUDE_PROJECTS.exists():
-        return UsageCost()
-
     pattern = str(CLAUDE_PROJECTS / "**" / "*.jsonl")
     for filename in glob.iglob(pattern, recursive=True):
         path = Path(filename)
@@ -591,7 +591,8 @@ def claude_costs() -> UsageCost:
     seven, seven_records = total_since(cutoffs["7d"])
     five = sum(float(record[1]) for record in seven_records if float(record[0]) >= cutoffs["5h"].timestamp())
     month, _ = total_since(cycle_start)
-    return UsageCost(five, seven, month=month)
+    pi = pi_costs(now, "anthropic")
+    return UsageCost(five + pi.five_hour, seven + pi.seven_day, month=month + pi.month)
 
 
 def extract_json_event(body: str) -> dict[str, Any] | None:
@@ -829,22 +830,29 @@ def codex_session_turn_cost(model: str, usage: dict[str, Any]) -> float:
     return openai_cost(model, uncached, cached_tokens, cache_write, output_tokens)
 
 
-def pi_codex_costs(now: dt.datetime) -> UsageCost:
-    """pi 走 Codex 订阅（openai-codex provider）的用量 —— 不经过 codex CLI，
-    旧版完全没统计，而 pi / pi-flow 恰恰是烧 Codex 的主力。pi-flow 派生的
-    executor/reviewer 子进程消息也落在同一批会话文件里。
-    pi 的 usage.input 已扣掉 cacheRead/cacheWrite（与它自己的 cost 计算口径一致）。"""
+def pi_costs(now: dt.datetime, provider: str) -> UsageCost:
+    """Merge session, archived-session and no-session ledger messages.
+
+    pi's usage.input already excludes cacheRead/cacheWrite. Never use its
+    costTotal: all sources go through the existing provider pricing functions.
+    """
     cutoff5 = now - WINDOWS["5h"]
     cutoff7 = now - WINDOWS["7d"]
-    cycle_start, _ = codex_cycle(now)
+    cycle_start, _ = claude_cycle(now) if provider == "anthropic" else codex_cycle(now)
     start = scan_start(now, cycle_start)
     index = load_month_index()
-    prepare_cycle_index(index, "pi", cycle_start)
+    namespace = f"pi-ledger-v1-{provider}"
+    prepare_cycle_index(index, namespace, cycle_start)
     records: list[list[Any]] = []
     seen_paths: set[str] = set()
-    if not PI_SESSIONS.exists():
-        return UsageCost()
-    for filename in glob.iglob(str(PI_SESSIONS / "**" / "*.jsonl"), recursive=True):
+    sources = [
+        (str(PI_SESSIONS / "**" / "*.jsonl"), False),
+        (str(PI_ARCHIVE / "*.jsonl"), False),
+        (str(PI_USAGE_LEDGER / "*.jsonl"), True),
+    ]
+    paths = ((filename, ledger) for pattern, ledger in sources
+             for filename in glob.iglob(pattern, recursive=True))
+    for filename, ledger in paths:
         path = Path(filename)
         seen_paths.add(str(path))
         try:
@@ -861,41 +869,63 @@ def pi_codex_costs(now: dt.datetime) -> UsageCost:
                 return parsed
             with fh:
                 for line in fh:
-                    if '"openai-codex"' not in line or '"usage"' not in line:
+                    if '"usage"' not in line:
                         continue
                     try:
                         item = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    msg = item.get("message") or {}
+                    msg = item if ledger else item.get("message") or {}
                     usage = msg.get("usage")
-                    if msg.get("provider") != "openai-codex" or not isinstance(usage, dict):
+                    if msg.get("provider") != provider or not isinstance(usage, dict):
                         continue
-                    when = parse_time(item.get("timestamp"))
-                    if when is None and isinstance(msg.get("timestamp"), (int, float)):
-                        when = dt.datetime.fromtimestamp(msg["timestamp"] / 1000, tz=dt.timezone.utc).astimezone()
+                    when = parse_time(item.get("ts") if ledger else item.get("timestamp"))
+                    if not ledger and isinstance(msg.get("timestamp"), (int, float)):
+                        when = parse_time(msg["timestamp"] / 1000) or when
                     if when is None or when < start:
                         continue
-                    key = msg.get("responseId") or (
-                        (item.get("id"), msg.get("timestamp")) if item.get("id") else None)
-                    cost = openai_cost(
-                        str(msg.get("model") or default_openai_model()),
-                        _num(usage.get("input")) or 0,
-                        _num(usage.get("cacheRead")) or 0,
-                        _num(usage.get("cacheWrite")) or 0,
-                        _num(usage.get("output")) or 0,
-                    )
+                    response_id = msg.get("responseId")
+                    if response_id:
+                        key = ["response", response_id]
+                    elif ledger:
+                        key = ["ledger", item.get("pid"), item.get("ts"), msg.get("model")]
+                    else:
+                        key = (["entry", item.get("id"), msg.get("timestamp")]
+                               if item.get("id") else None)
+                    model = str(msg.get("model") or default_openai_model())
+                    if provider == "anthropic":
+                        cost = claude_entry_cost(model, {
+                            "input_tokens": usage.get("input"),
+                            "output_tokens": usage.get("output"),
+                            "cache_read_input_tokens": usage.get("cacheRead"),
+                            "cache_creation_input_tokens": usage.get("cacheWrite"),
+                        })
+                    else:
+                        cost = openai_cost(
+                            model,
+                            _num(usage.get("input")) or 0,
+                            _num(usage.get("cacheRead")) or 0,
+                            _num(usage.get("cacheWrite")) or 0,
+                            _num(usage.get("output")) or 0,
+                        )
                     parsed.append([
-                        when.timestamp(),
-                        cost,
+                        when.timestamp(), cost,
                         json.dumps(key, sort_keys=True) if key is not None else None,
+                        model, ledger, bool(response_id),
                     ])
             return parsed
 
-        records.extend(indexed_records(index, "pi", path, cycle_start, parse_file))
+        records.extend(indexed_records(index, namespace, path, cycle_start, parse_file))
 
-    prune_month_index(index, "pi", seen_paths)
+    prune_month_index(index, namespace, seen_paths)
     write_month_index(index)
+
+    session_times: dict[str, list[float]] = {}
+    for record in records:
+        if not record[4]:
+            session_times.setdefault(record[3], []).append(float(record[0]))
+    for times in session_times.values():
+        times.sort()
 
     def chosen_since(cutoff: dt.datetime) -> list[list[Any]]:
         chosen: list[list[Any]] = []
@@ -903,6 +933,11 @@ def pi_codex_costs(now: dt.datetime) -> UsageCost:
         for record in records:
             if float(record[0]) < cutoff.timestamp():
                 continue
+            if record[4] and not record[5]:
+                times = session_times.get(record[3], [])
+                pos = bisect_left(times, float(record[0]) - 2)
+                if pos < len(times) and times[pos] <= float(record[0]) + 2:
+                    continue
             key = record[2]
             if key is not None:
                 if key in seen:
@@ -918,6 +953,10 @@ def pi_codex_costs(now: dt.datetime) -> UsageCost:
         sum(float(record[1]) for record in seven_records),
         month=sum(float(record[1]) for record in month_records),
     )
+
+
+def pi_codex_costs(now: dt.datetime) -> UsageCost:
+    return pi_costs(now, "openai-codex")
 
 
 def codex_costs() -> UsageCost:

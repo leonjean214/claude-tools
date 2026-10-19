@@ -362,6 +362,11 @@ cp wsl/claude-resume.sh ~/bin/claude-resume.sh && chmod +x ~/bin/claude-resume.s
 
 ---
 
+### How pi usage is counted (`statusline/usage`)
+
+pi usage is included in the cost line: each assistant reply is priced with its own model's rates and summed (pi's own `cost.total` is ignored); `anthropic` replies go to the Claude column and `openai-codex` replies to the Codex column; three sources (sessions, archive, [`pi/usage-ledger`](pi/usage-ledger/README.md) ledger) are de-duplicated by `responseId`. pi-flow users: see the `feature/report-language-toggle` branch of [leonjean214/pi-flow](https://github.com/leonjean214/pi-flow) (sub-processes are recorded per role). Details in Chinese below.
+
+
 ## 中文
 
 ### 脚本一览
@@ -674,6 +679,16 @@ cp wsl/claude-resume.sh ~/bin/claude-resume.sh && chmod +x ~/bin/claude-resume.s
 *（需要将 `mac/quota-wait` 安装到 WSL 的 `~/bin/quota-wait`，该脚本为纯 Python，在 Linux 下直接可用。）*
 
 ---
+
+### pi 用量怎么算（`statusline/usage`）
+
+pi 的用量也计入状态栏的费用行：
+
+- **逐条回复单独算**：每条 assistant 回复按**它自己的模型**单价算，再相加；不用 pi 自带的 `cost.total`。
+- **按 provider 分栏**：`anthropic` 记进 Claude 一栏，`openai-codex` 记进 Codex 一栏。
+- **三处来源，按 `responseId` 去重**：pi 会话（`~/.pi/agent/sessions`）、会话归档（`~/.pi-conversation-archive`）、记账本（`~/.pi/agent/usage-ledger`，由 [`pi/usage-ledger`](pi/usage-ledger/README.md) 扩展写入，能覆盖 `--no-session` 的子进程）。同一条回复出现在多处只算一次。
+- **pi-flow 用户**：executor / reviewer 子进程按角色记账的改动在 [leonjean214/pi-flow](https://github.com/leonjean214/pi-flow) 的 `feature/report-language-toggle` 分支。
+
 
 ## Français
 

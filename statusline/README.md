@@ -34,3 +34,13 @@ Windows 把 `python3` 换成 `python`，路径写成 `%USERPROFILE%\\claude-tool
 - **费用行**：`usage` 读 `~/.claude/projects` 和 `~/.codex/sessions` 本地日志，按 API 单价估算等价费用。不用装，status line 会在后台自动调用；想放在别处就设环境变量 `TT_USAGE_CMD=/path/to/usage`。
 - **Codex 额度行**：装了 Codex CLI 的话，定时跑 `codex-quota-watch`（例如 cron / launchd 每分钟一次）。没装 Codex 这一行就不显示。
 - 订阅月费在 `tt-statusline.py` 的 `CLAUDE_SUB_MONTHLY` / `CODEX_SUB_MONTHLY`，默认都是 20 美元，按自己套餐改。
+
+## pi 用量怎么算（`statusline/usage`）
+
+pi 的用量也计入状态栏的费用行：
+
+- **逐条回复单独算**：每条 assistant 回复按**它自己的模型**单价算，再相加；不用 pi 自带的 `cost.total`。
+- **按 provider 分栏**：`anthropic` 记进 Claude 一栏，`openai-codex` 记进 Codex 一栏。
+- **三处来源，按 `responseId` 去重**：pi 会话（`~/.pi/agent/sessions`）、会话归档（`~/.pi-conversation-archive`）、记账本（`~/.pi/agent/usage-ledger`，由 [`pi/usage-ledger`](../pi/usage-ledger/README.md) 扩展写入，能覆盖 `--no-session` 的子进程）。同一条回复出现在多处只算一次。
+- **pi-flow 用户**：executor / reviewer 子进程按角色记账的改动在 [leonjean214/pi-flow](https://github.com/leonjean214/pi-flow) 的 `feature/report-language-toggle` 分支。
+
