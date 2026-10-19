@@ -37,6 +37,7 @@ Non-destructive and reversible (`-X DELETE` to unstar). No user confirmation nee
 
 | Script | Platform | Purpose |
 |---|---|---|
+| `statusline/tt-statusline.py` | macOS / Linux / Windows | Status line: 5h/7d quota bars, reset countdown, context bar ([setup](statusline/README.md)) |
 | `mac/check-quota` | macOS | One-shot quota status display |
 | `windows/check-quota.ps1` | Windows | One-shot quota status display |
 | `mac/quota-wait` | macOS | Block until quota available; `--watch` daemon mode |
@@ -367,6 +368,7 @@ cp wsl/claude-resume.sh ~/bin/claude-resume.sh && chmod +x ~/bin/claude-resume.s
 
 | 脚本 | 平台 | 用途 |
 |---|---|---|
+| `statusline/tt-statusline.py` | macOS / Linux / Windows | 底部状态栏：5h/7d 额度条、重置倒计时、上下文条（[安装](statusline/README.md)） |
 | `mac/check-quota` | macOS | 一键查看当前额度 |
 | `windows/check-quota.ps1` | Windows | 一键查看当前额度 |
 | `mac/quota-wait` | macOS | 阻塞等待额度可用；`--watch` 守护模式 |
@@ -679,6 +681,7 @@ cp wsl/claude-resume.sh ~/bin/claude-resume.sh && chmod +x ~/bin/claude-resume.s
 
 | Script | Plateforme | Usage |
 |---|---|---|
+| `statusline/tt-statusline.py` | macOS / Linux / Windows | Barre d’état : quotas 5h/7j, compte à rebours, contexte ([installation](statusline/README.md)) |
 | `mac/check-quota` | macOS | Affichage ponctuel du quota |
 | `windows/check-quota.ps1` | Windows | Affichage ponctuel du quota |
 | `mac/quota-wait` | macOS | Attente bloquante ; mode démon `--watch` |

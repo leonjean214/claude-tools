@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""Refresh Codex rate limits and notify once per threshold crossing."""
+
+import argparse
+import shutil
+import datetime as dt
+import json
+import os
+import select
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+CODEX = shutil.which("codex") or os.path.expanduser("~/.local/bin/codex")
+STATUS_FILE = Path(os.path.expanduser("~/.codex/quota-status.json"))
+STATE_FILE = Path(os.path.expanduser("~/.codex/quota-watch-state.json"))
+THRESHOLDS = (75, 90, 100)
+
+
+def fetch_limits():
+    messages = (
+        {
+            "method": "initialize",
+            "id": 0,
+            "params": {
+                "clientInfo": {
+                    "name": "codex_quota_watch",
+                    "title": "Codex Quota Watch",
+                    "version": "1.0.0",
+                }
+            },
+        },
+        {"method": "initialized", "params": {}},
+        {"method": "account/rateLimits/read", "id": 1, "params": None},
+    )
+    process = subprocess.Popen(
+        [CODEX, "app-server"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        for message in messages:
+            process.stdin.write(json.dumps(message) + "\n")
+        process.stdin.flush()
+
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([process.stdout], [], [], 1)
+            if not ready:
+                if process.poll() is not None:
+                    break
+                continue
+            line = process.stdout.readline()
+            if not line:
+                break
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if message.get("id") == 1:
+                if "error" in message:
+                    raise RuntimeError(message["error"].get("message", "rate-limit query failed"))
+                response = message["result"]
+                return response.get("rateLimitsByLimitId", {}).get("codex") or response["rateLimits"]
+
+        detail = process.stderr.read().strip() if process.poll() is not None else "query timed out"
+        raise RuntimeError(detail or f"codex app-server exited {process.returncode}")
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+
+
+def load_json(path, default):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def write_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+    os.replace(temporary, path)
+
+
+def local_time(timestamp):
+    if not timestamp:
+        return "未知时间"
+    return dt.datetime.fromtimestamp(timestamp).astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def notify(title, message):
+    script = 'display notification {message} with title {title} sound name "Glass"'
+    subprocess.run(
+        [
+            "/usr/bin/osascript",
+            "-e",
+            script.format(message=json.dumps(message), title=json.dumps(title)),
+        ],
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+
+def normalized_status(limits):
+    now = dt.datetime.now().astimezone()
+    return {
+        "updatedAt": now.isoformat(timespec="seconds"),
+        "planType": limits.get("planType"),
+        "credits": limits.get("credits"),
+        "primary": limits.get("primary"),
+        "weekly": limits.get("secondary"),
+    }
+
+
+def notify_crossings(status):
+    state = load_json(STATE_FILE, {"windows": {}})
+    windows_state = state.setdefault("windows", {})
+
+    for name, label in (("primary", "5 小时额度"), ("weekly", "Weekly 额度")):
+        window = status.get(name) or {}
+        used = int(window.get("usedPercent", 0))
+        reset = window.get("resetsAt")
+        previous = windows_state.get(name, {})
+
+        # A new server-side quota window only when the reset moves materially;
+        # the usage endpoint jitters resetsAt by a few seconds between polls, so
+        # tolerate small drift to avoid clearing the dedup set and re-notifying.
+        prev_reset = previous.get("resetsAt")
+        if prev_reset is None or not reset or abs(reset - prev_reset) > 300:
+            previous = {"resetsAt": reset, "notified": []}
+
+        notified = set(previous.get("notified", []))
+        for threshold in THRESHOLDS:
+            if used >= threshold and threshold not in notified:
+                notify(
+                    f"Codex {label}已使用 {used}%",
+                    f"达到 {threshold}% 提醒阈值，重置时间：{local_time(reset)}",
+                )
+                notified.add(threshold)
+
+        previous["usedPercent"] = used
+        previous["resetsAt"] = reset
+        previous["notified"] = sorted(notified)
+        windows_state[name] = previous
+
+    state["updatedAt"] = status["updatedAt"]
+    write_json(STATE_FILE, state)
+
+
+def print_status(status):
+    print(f"Codex {status.get('planType') or 'unknown'} | 更新 {status['updatedAt']}")
+    for key, label in (("primary", "5h"), ("weekly", "7d")):
+        window = status.get(key) or {}
+        print(
+            f"{label}: 已使用 {window.get('usedPercent', '?')}% | "
+            f"重置 {local_time(window.get('resetsAt'))}"
+        )
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--status", action="store_true", help="刷新并打印当前额度")
+    parser.add_argument("--test-notification", action="store_true")
+    args = parser.parse_args()
+
+    if args.test_notification:
+        notify("Codex 额度监控已启用", "每分钟刷新；达到 75%、90%、100% 时通知")
+        return
+
+    try:
+        status = normalized_status(fetch_limits())
+        write_json(STATUS_FILE, status)
+        notify_crossings(status)
+        if args.status:
+            print_status(status)
+    except Exception as error:
+        print(f"{dt.datetime.now().astimezone().isoformat()} refresh failed: {error}", file=sys.stderr)
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()
