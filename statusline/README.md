@@ -42,5 +42,8 @@ pi 的用量也计入状态栏的费用行：
 - **逐条回复单独算**：每条 assistant 回复按**它自己的模型**单价算，再相加；不用 pi 自带的 `cost.total`。
 - **按 provider 分栏**：`anthropic` 记进 Claude 一栏，`openai-codex` 记进 Codex 一栏。
 - **三处来源，按 `responseId` 去重**：pi 会话（`~/.pi/agent/sessions`）、会话归档（`~/.pi-conversation-archive`）、记账本（`~/.pi/agent/usage-ledger`，由 [`pi/usage-ledger`](../pi/usage-ledger/README.md) 扩展写入，能覆盖 `--no-session` 的子进程）。同一条回复出现在多处只算一次。
+- **pi 调 Claude（claude-bridge）记在 Claude 栏**：这类用量的来源是 `~/.claude/projects`（Claude Code 自己的日志），所以已经算在 Claude 栏里；pi 侧的记录只作说明，**不会重复相加**。
+- **`usage --breakdown`**：在总览下多出两张表。「Codex」表把 Codex 栏拆成 codex CLI / pi 有会话 / pi 无会话（子进程）三类，按角色和模型列出 5h / 7d / 本期费用，合计等于 Codex 栏；「Claude 栏中 pi 经 claude-bridge 的部分」只是说明值，不加进 Claude 合计。每行不足 $0.01 的并入「其他」。
+- **状态栏**：Codex 5h 费用后若有 pi / 子进程份额，会追加 ` (pi $x·子 $y)`；没有就和以前一样。
 - **pi-flow 用户**：executor / reviewer 子进程按角色记账的改动在 [leonjean214/pi-flow](https://github.com/leonjean214/pi-flow) 的 `feature/report-language-toggle` 分支。
 

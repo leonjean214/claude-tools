@@ -154,7 +154,7 @@ def load_cost_cache() -> dict[str, UsageCost] | None:
     return {"claude": claude, "codex": codex}
 
 
-def write_cost_cache(claude: UsageCost, codex: UsageCost) -> None:
+def write_cost_cache(claude: UsageCost, codex: UsageCost, breakdown: dict[str, Any] | None = None) -> None:
     try:
         now = now_local()
         USAGE_CACHE.parent.mkdir(parents=True, exist_ok=True)
@@ -166,6 +166,7 @@ def write_cost_cache(claude: UsageCost, codex: UsageCost) -> None:
                     "cycles": billing_cycle_keys(now),
                     "claude": cost_to_dict(claude),
                     "codex": cost_to_dict(codex),
+                    **({"breakdown": breakdown} if breakdown is not None else {}),
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -830,18 +831,21 @@ def codex_session_turn_cost(model: str, usage: dict[str, Any]) -> float:
     return openai_cost(model, uncached, cached_tokens, cache_write, output_tokens)
 
 
-def pi_costs(now: dt.datetime, provider: str) -> UsageCost:
+def pi_costs(now: dt.datetime, provider: str, sink: dict[str, Any] | None = None) -> UsageCost:
     """Merge session, archived-session and no-session ledger messages.
 
     pi's usage.input already excludes cacheRead/cacheWrite. Never use its
     costTotal: all sources go through the existing provider pricing functions.
+    When `sink` is given, the chosen records are also accumulated into
+    sink[(source, role, model)] = [five_hour, seven_day, month].
     """
+    claude_priced = provider in ("anthropic", "claude-bridge")
     cutoff5 = now - WINDOWS["5h"]
     cutoff7 = now - WINDOWS["7d"]
-    cycle_start, _ = claude_cycle(now) if provider == "anthropic" else codex_cycle(now)
+    cycle_start, _ = claude_cycle(now) if claude_priced else codex_cycle(now)
     start = scan_start(now, cycle_start)
     index = load_month_index()
-    namespace = f"pi-ledger-v1-{provider}"
+    namespace = f"pi-ledger-v2-{provider}"
     prepare_cycle_index(index, namespace, cycle_start)
     records: list[list[Any]] = []
     seen_paths: set[str] = set()
@@ -893,7 +897,7 @@ def pi_costs(now: dt.datetime, provider: str) -> UsageCost:
                         key = (["entry", item.get("id"), msg.get("timestamp")]
                                if item.get("id") else None)
                     model = str(msg.get("model") or default_openai_model())
-                    if provider == "anthropic":
+                    if claude_priced:
                         cost = claude_entry_cost(model, {
                             "input_tokens": usage.get("input"),
                             "output_tokens": usage.get("output"),
@@ -912,6 +916,8 @@ def pi_costs(now: dt.datetime, provider: str) -> UsageCost:
                         when.timestamp(), cost,
                         json.dumps(key, sort_keys=True) if key is not None else None,
                         model, ledger, bool(response_id),
+                        (str(item.get("role") or "-") if ledger else "-"),
+                        "pi-nosession" if ledger and not item.get("session") else "pi-session",
                     ])
             return parsed
 
@@ -930,6 +936,7 @@ def pi_costs(now: dt.datetime, provider: str) -> UsageCost:
     def chosen_since(cutoff: dt.datetime) -> list[list[Any]]:
         chosen: list[list[Any]] = []
         seen: set[str] = set()
+        chosen_at: dict[str, list[Any]] = {}
         for record in records:
             if float(record[0]) < cutoff.timestamp():
                 continue
@@ -941,13 +948,27 @@ def pi_costs(now: dt.datetime, provider: str) -> UsageCost:
             key = record[2]
             if key is not None:
                 if key in seen:
+                    # Same response seen in a session file and in the ledger: the amount
+                    # is counted once, but the ledger knows the no-session process/role.
+                    if record[7] == "pi-nosession" and chosen_at[key][7] != "pi-nosession":
+                        chosen[chosen_at[key][8]] = chosen_at[key] = (
+                            list(chosen_at[key][:6]) + [record[6], record[7], chosen_at[key][8]])
                     continue
                 seen.add(key)
+                chosen_at[key] = list(record[:8]) + [len(chosen)]
             chosen.append(record)
         return chosen
 
     seven_records = chosen_since(cutoff7)
     month_records = chosen_since(cycle_start)
+    if sink is not None:
+        five_ts = cutoff5.timestamp()
+        for slot, group in ((1, seven_records), (2, month_records)):
+            for record in group:
+                row = sink.setdefault((record[7], record[6], record[3]), [0.0, 0.0, 0.0])
+                row[slot] += float(record[1])
+                if slot == 1 and float(record[0]) >= five_ts:
+                    row[0] += float(record[1])
     return UsageCost(
         sum(float(record[1]) for record in seven_records if float(record[0]) >= cutoff5.timestamp()),
         sum(float(record[1]) for record in seven_records),
@@ -959,7 +980,7 @@ def pi_codex_costs(now: dt.datetime) -> UsageCost:
     return pi_costs(now, "openai-codex")
 
 
-def codex_costs() -> UsageCost:
+def codex_costs(sink: dict[str, Any] | None = None) -> UsageCost:
     now = now_local()
     cli = codex_costs_from_sessions(now)
     month = cli.month if cli is not None else 0.0
@@ -976,13 +997,77 @@ def codex_costs() -> UsageCost:
     # not add them together. Retain the broadest monthly result seen while the
     # 5h/7d source-selection behavior remains exactly as before.
     cli.month = month
-    pi = pi_codex_costs(now)
+    pi = pi_costs(now, "openai-codex", sink) if sink is not None else pi_codex_costs(now)
+    if sink is not None:
+        sink[("cli", "-", "-")] = [cli.five_hour, cli.seven_day, cli.month]
     return UsageCost(
         cli.five_hour + pi.five_hour,
         cli.seven_day + pi.seven_day,
         estimated=cli.estimated,
         month=cli.month + pi.month,
     )
+
+
+def collect_costs() -> tuple[UsageCost, UsageCost, dict[str, Any]]:
+    """Compute both services plus the per-source breakdown (usage-costs.json `breakdown`)."""
+    now = now_local()
+    codex_sink: dict[Any, Any] = {}
+    claude_cost = claude_costs()
+    codex_cost = codex_costs(codex_sink)
+    bridge_sink: dict[Any, Any] = {}
+    bridge = pi_costs(now, "claude-bridge", bridge_sink)
+
+    def rows(sink: dict[Any, Any]) -> list[dict[str, Any]]:
+        return [
+            {"source": k[0], "role": k[1], "model": k[2],
+             "five_hour": v[0], "seven_day": v[1], "month": v[2]}
+            for k, v in sorted(sink.items())
+        ]
+
+    breakdown = {
+        "codex": rows(codex_sink),
+        "claude": {
+            # Already inside ~/.claude/projects totals; informational, never added again.
+            "pi_bridge_included": {
+                "five_hour": bridge.five_hour, "seven_day": bridge.seven_day, "month": bridge.month,
+            },
+            "pi_bridge_rows": rows(bridge_sink),
+        },
+    }
+    return claude_cost, codex_cost, breakdown
+
+
+def print_breakdown(breakdown: dict[str, Any], codex: UsageCost) -> None:
+    def table(title: str, rows: list[dict[str, Any]]) -> None:
+        print(title)
+        print(f"  {'来源':<13} {'角色':<10} {'模型':<20} {'5h':>9} {'7d':>9} {'本期':>9}")
+        other = [0.0, 0.0, 0.0]
+        has_other = False
+        for r in rows:
+            vals = [r["five_hour"], r["seven_day"], r["month"]]
+            if max(vals) < 0.01:
+                has_other = True
+                for i, v in enumerate(vals):
+                    other[i] += v
+                continue
+            print(f"  {r['source']:<13} {r['role']:<10} {r['model']:<20} "
+                  f"{fmt_cost(vals[0]):>9} {fmt_cost(vals[1]):>9} {fmt_cost(vals[2]):>9}")
+        if has_other:
+            print(f"  {'其他':<13} {'':<10} {'(< $0.01 合并)':<20} "
+                  f"{fmt_cost(other[0]):>9} {fmt_cost(other[1]):>9} {fmt_cost(other[2]):>9}")
+
+    print("=== 费用拆分 ===")
+    rows = breakdown["codex"]
+    table("Codex（codex CLI + pi 有会话 + pi 无会话）", rows)
+    sums = [sum(r[k] for r in rows) for k in ("five_hour", "seven_day", "month")]
+    print(f"  {'合计':<13} {'':<10} {'':<20} "
+          f"{fmt_cost(sums[0]):>9} {fmt_cost(sums[1]):>9} {fmt_cost(sums[2]):>9}"
+          f"   (Codex 栏 {fmt_cost(codex.five_hour)} / {fmt_cost(codex.seven_day)} / {fmt_cost(codex.month)})")
+    inc = breakdown["claude"]["pi_bridge_included"]
+    table("Claude 栏中 pi 经 claude-bridge 的部分（已计入 ~/.claude/projects，未重复相加）",
+          breakdown["claude"]["pi_bridge_rows"])
+    print(f"  {'小计':<13} {'':<10} {'':<20} "
+          f"{fmt_cost(inc['five_hour']):>9} {fmt_cost(inc['seven_day']):>9} {fmt_cost(inc['month']):>9}")
 
 
 def print_service(
@@ -1005,13 +1090,20 @@ def print_service(
     )
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     display_now = now_local()
+    want_breakdown = "--breakdown" in (argv if argv is not None else sys.argv[1:])
+    breakdown = None
     cached_costs = load_cost_cache()
+    if cached_costs is not None and want_breakdown:
+        cached_breakdown = (load_json(USAGE_CACHE) or {}).get("breakdown")
+        if isinstance(cached_breakdown, dict):
+            breakdown = cached_breakdown
+        else:
+            cached_costs = None
     if cached_costs is None:
-        claude_cost = claude_costs()
-        codex_cost = codex_costs()
-        write_cost_cache(claude_cost, codex_cost)
+        claude_cost, codex_cost, breakdown = collect_costs()
+        write_cost_cache(claude_cost, codex_cost, breakdown)
     else:
         claude_cost = cached_costs["claude"]
         codex_cost = cached_costs["codex"]
@@ -1028,6 +1120,9 @@ def main() -> int:
         f"7d {fmt_cost(total7):>8}    mo {fmt_cost(total_month):>8}{total_note}"
     )
     print("cost 为等价 API 定价估算（Codex 含 codex CLI + pi），非 ChatGPT/Claude 订阅真实账单。")
+    if want_breakdown and breakdown is not None:
+        print()
+        print_breakdown(breakdown, codex_cost)
     return 0
 
 

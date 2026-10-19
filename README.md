@@ -364,7 +364,7 @@ cp wsl/claude-resume.sh ~/bin/claude-resume.sh && chmod +x ~/bin/claude-resume.s
 
 ### How pi usage is counted (`statusline/usage`)
 
-pi usage is included in the cost line: each assistant reply is priced with its own model's rates and summed (pi's own `cost.total` is ignored); `anthropic` replies go to the Claude column and `openai-codex` replies to the Codex column; three sources (sessions, archive, [`pi/usage-ledger`](pi/usage-ledger/README.md) ledger) are de-duplicated by `responseId`. pi-flow users: see the `feature/report-language-toggle` branch of [leonjean214/pi-flow](https://github.com/leonjean214/pi-flow) (sub-processes are recorded per role). Details in Chinese below.
+pi usage is included in the cost line: each assistant reply is priced with its own model's rates and summed (pi's own `cost.total` is ignored); `anthropic` replies go to the Claude column and `openai-codex` replies to the Codex column; three sources (sessions, archive, [`pi/usage-ledger`](pi/usage-ledger/README.md) ledger) are de-duplicated by `responseId`. pi-flow users: see the `feature/report-language-toggle` branch of [leonjean214/pi-flow](https://github.com/leonjean214/pi-flow) (sub-processes are recorded per role). pi calls to Claude via `claude-bridge` are counted in the Claude column, sourced from `~/.claude/projects`; the pi-side records are informational only and never added again, so nothing is double-counted. `statusline/usage --breakdown` prints a table splitting the Codex column into codex CLI / pi with session / pi without session (sub-processes), plus the claude-bridge share as an informational line; the statusline appends ` (pi $x·子 $y)` after the Codex 5h cost when those shares are non-trivial. Details in Chinese below.
 
 
 ## 中文

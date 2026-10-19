@@ -178,6 +178,27 @@ def fmt_cost(value):
     return f"~${value:.2f}"
 
 
+def codex_share_suffix(usage_costs, key="five_hour"):
+    """breakdown 里 pi 与无会话子进程在 key 窗口的 Codex 费用 -> " (pi $x·子 $y)"。
+    读不到/损坏/都为 0 时返回空串；子进程不足 $0.01 不显示。"""
+    try:
+        pi = sub = 0.0
+        for row in usage_costs["breakdown"]["codex"]:
+            v = float(row.get(key) or 0)
+            if (row.get("role") or "-") != "-":
+                sub += v
+            elif str(row.get("source", "")).startswith("pi"):
+                pi += v
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return ""
+    parts = []
+    if pi >= 0.005:
+        parts.append(f"pi ${pi:.2f}")
+    if sub >= 0.01:
+        parts.append(f"子 ${sub:.2f}")
+    return f" ({'·'.join(parts)})" if parts else ""
+
+
 # 订阅月费 (USD)：把等价 API 成本换算成"几倍订阅价值"用。改套餐改这里。
 CLAUDE_SUB_MONTHLY = 20.0   # Claude Pro
 CODEX_SUB_MONTHLY = 20.0    # ChatGPT Plus
@@ -298,6 +319,12 @@ def render(data, now):
             f"{C['blue']}5h:{C['reset']}{fmt_cost(codex_usage_cost.get('five_hour'))}",
             f"{C['blue']}7d:{C['reset']}{fmt_cost(codex_usage_cost.get('seven_day'))}",
         ]
+        share = codex_share_suffix(usage_costs)
+        if share:
+            with_share = list(codex_cost_line)
+            with_share[1] += share
+            if vlen(" | ".join(with_share)) <= W:
+                codex_cost_line = with_share
         with_month = codex_cost_line + [
             f"{C['blue']}mo:{C['reset']}{fmt_cost(codex_usage_cost.get('month'))}"
         ]
