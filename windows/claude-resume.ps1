@@ -18,13 +18,15 @@ try {
     $qResp = Invoke-RestMethod -Uri "https://api.anthropic.com/api/oauth/usage" `
         -Headers @{ "Authorization" = "Bearer $qToken" } -ErrorAction Stop
 
-    # 无 5h 窗口的套餐（如 Claude Ultra）five_hour 为 null
+    # Plans without a 5h window (e.g. Claude Ultra) return five_hour: null
     $u5 = if ($null -ne $qResp.five_hour) { [float]($qResp.five_hour.utilization ?? 0) } else { $null }
     $r5 = if ($null -ne $qResp.five_hour) { $qResp.five_hour.resets_at } else { $null }
     $u7 = [float]($qResp.seven_day.utilization ?? 0)
     $r7 = $qResp.seven_day.resets_at
 
-    $u5txt = if ($null -eq $u5) { "none" } else { "$([math]::Round($u5))%" }
+    # five_hour present-but-null = plan has no 5h window; key absent = unknown
+    $has5 = $null -ne $qResp.PSObject.Properties['five_hour']
+    $u5txt = if ($null -ne $u5) { "$([math]::Round($u5))%" } elseif ($has5) { "none" } else { "?" }
     Add-Content -Path $logPath -Value "[$((Get-Date).ToString('HH:mm:ss'))] Quota: 5h=$u5txt 7d=$([math]::Round($u7))%"
 
     if ($null -ne $u5 -and $u5 -ge 100 -and $r5) {

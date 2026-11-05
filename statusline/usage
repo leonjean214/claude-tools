@@ -408,9 +408,11 @@ def fallback_status(command: list[str], parser: str) -> dict[str, WindowStatus]:
 
 
 def _rate_window(limits: dict[str, Any], key: str) -> WindowStatus:
-    entry = limits.get(key)
+    # key 缺失 → 未知；key 存在且为 null → 订阅没有该窗口（如 Claude Ultra 的 five_hour=null）。
+    if key not in limits:
+        return WindowStatus()
+    entry = limits[key]
     if entry is None:
-        # 订阅没有该窗口（如 Claude Ultra 的 five_hour=null）
         return WindowStatus(missing=True)
     if not isinstance(entry, dict):
         return WindowStatus()
@@ -425,7 +427,10 @@ def claude_status() -> dict[str, WindowStatus]:
     if not data:
         return fallback_status([str(HOME / "bin" / "quota-wait"), "--status"], "claude")
 
-    limits = data.get("rate_limits") or {}
+    limits = data.get("rate_limits")
+    if not isinstance(limits, dict):
+        # rate_limits 为 null/缺失（且 tt-statusline 无历史可沿用）→ 两个窗口都未知
+        return {"5h": WindowStatus(), "7d": WindowStatus()}
     return {
         "5h": _rate_window(limits, "five_hour"),
         "7d": _rate_window(limits, "seven_day"),

@@ -73,6 +73,50 @@ class ClaudeStatusTest(unittest.TestCase):
         self.assertEqual(status["7d"].used_pct, 33)
         self.assertFalse(status["7d"].missing)
 
+    def assert_both_unknown(self, status):
+        for key in ("5h", "7d"):
+            self.assertFalse(status[key].missing, key)
+            self.assertIsNone(status[key].used_pct, key)
+
+    def test_rate_limits_null_is_unknown(self):
+        write_json(self.status_file, {"rate_limits": None})
+        self.assert_both_unknown(usage.claude_status())
+
+    def test_rate_limits_absent_is_unknown(self):
+        write_json(self.status_file, {"model": {"id": "claude-opus"}})
+        self.assert_both_unknown(usage.claude_status())
+
+    def test_rate_limits_empty_is_unknown(self):
+        write_json(self.status_file, {"rate_limits": {}})
+        self.assert_both_unknown(usage.claude_status())
+
+    def test_both_windows_null(self):
+        write_json(self.status_file, {"rate_limits": {"five_hour": None, "seven_day": None}})
+        status = usage.claude_status()
+        self.assertTrue(status["5h"].missing)
+        self.assertTrue(status["7d"].missing)
+
+    def test_print_service_null_rate_limits_not_no_limit(self):
+        write_json(self.status_file, {"rate_limits": None})
+        now = usage.now_local()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            usage.print_service("Claude", usage.claude_status(), usage.UsageCost(), (now, now))
+        out = buf.getvalue()
+        self.assertIn("??%", out)
+        self.assertNotIn("无 5h 限制", out)
+        self.assertNotIn("无 7d 限制", out)
+
+    def test_print_service_both_null_shows_no_limit(self):
+        write_json(self.status_file, {"rate_limits": {"five_hour": None, "seven_day": None}})
+        now = usage.now_local()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            usage.print_service("Claude", usage.claude_status(), usage.UsageCost(), (now, now))
+        out = buf.getvalue()
+        self.assertIn("无 5h 限制", out)
+        self.assertIn("无 7d 限制", out)
+
 
 class CodexStatusTest(unittest.TestCase):
     def setUp(self):
