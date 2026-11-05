@@ -76,3 +76,13 @@ schedule-next-resume 通过；claude-resume.sh 内嵌 python 用新旧 JSON 手�
 
 - 目标分支：`feat/w66-quota-ultra`，PR base=`main`，不合并。
 - 本环境是 worktree 文件副本（无 .git），未运行 git；commit/push/开 PR 由 Mac 端回传后处理。
+
+## 审查修复（w66fix94，commit 6825e3a）
+
+Codex 审查阻塞：`_rate_window` 用 `limits.get(key)`，把「key 缺失」「rate_limits 为 null」也当成「无限制」，导致错报。
+
+- `statusline/usage`：`claude_status()` 中 `rate_limits` 非 dict（null/缺失）→ 5h/7d 都未知（`??%`）；`_rate_window()` 中 key 缺失 → 未知，只有 key 存在且值为 null 才 `missing=True`。
+- `statusline/test_quota_windows.py`：新增 rate_limits=null / 缺失 / `{}`、两窗口都 null、`print_service` 输出层共 6 个用例。
+- `windows/claude-resume.ps1`：five_hour key 缺失日志记 `5h=?`，显式 null 记 `5h=none`；等待逻辑不变。
+- 验证：`uvx --from pytest pytest statusline/ -q` → 23 passed；`python3 -m unittest statusline/test_quota_windows.py` → OK；新增用例在旧版上有 4 个失败。
+- 既有问题（未修）：`claude-resume.ps1` 用了 PS 7 才支持的 `??`，在 Windows PowerShell 5.1 下解析失败（base 起就这样）。`codex_status()` 对 primary/weekly 缺失同样标 missing，同类语义，不在本次范围。
