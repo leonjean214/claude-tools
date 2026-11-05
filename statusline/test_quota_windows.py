@@ -90,6 +90,12 @@ class ClaudeStatusTest(unittest.TestCase):
         write_json(self.status_file, {"rate_limits": {}})
         self.assert_both_unknown(usage.claude_status())
 
+    def test_non_object_cache_is_unknown(self):
+        for value in ([1], "invalid", 12, True):
+            with self.subTest(value=value):
+                write_json(self.status_file, value)
+                self.assert_both_unknown(usage.claude_status())
+
     def test_both_windows_null(self):
         write_json(self.status_file, {"rate_limits": {"five_hour": None, "seven_day": None}})
         status = usage.claude_status()
@@ -149,6 +155,76 @@ class CodexStatusTest(unittest.TestCase):
         self.assertEqual(status["5h"].used_pct, 55)
         self.assertEqual(status["7d"].used_pct, 15)
 
+    def test_absent_fields_stay_unknown(self):
+        write_json(self.status_file, {"updatedAt": "test"})
+        status = usage.codex_status()
+        for slot in ("5h", "7d"):
+            self.assertIsNone(status[slot].used_pct)
+            self.assertFalse(status[slot].missing)
+
+    def test_missing_or_invalid_window_stays_unknown(self):
+        for name, slot, other, other_slot in (
+            ("primary", "5h", "weekly", "7d"),
+            ("weekly", "7d", "primary", "5h"),
+        ):
+            for value in ("absent", "invalid", 12, [], {}):
+                with self.subTest(name=name, value=value):
+                    data = {other: {"usedPercent": 25, "resetsAt": RESET_TS}}
+                    if value != "absent":
+                        data[name] = value
+                    write_json(self.status_file, data)
+                    status = usage.codex_status()
+                    self.assertIsNone(status[slot].used_pct)
+                    self.assertFalse(status[slot].missing)
+                    self.assertEqual(status[other_slot].used_pct, 25)
+                    self.assertFalse(status[other_slot].missing)
+
+    def test_invalid_percentage_is_unknown_not_missing(self):
+        for value in ({}, {"usedPercent": "?"}):
+            with self.subTest(value=value):
+                write_json(self.status_file, {"primary": value, "weekly": value})
+                for window in usage.codex_status().values():
+                    self.assertIsNone(window.used_pct)
+                    self.assertFalse(window.missing)
+
+    def test_explicit_null_windows(self):
+        for data, missing, known in (
+            ({"primary": None, "weekly": {"usedPercent": 25}}, "5h", "7d"),
+            ({"primary": {"usedPercent": 25}, "weekly": None}, "7d", "5h"),
+        ):
+            with self.subTest(missing=missing):
+                write_json(self.status_file, data)
+                status = usage.codex_status()
+                self.assertTrue(status[missing].missing)
+                self.assertIsNone(status[missing].used_pct)
+                self.assertEqual(status[known].used_pct, 25)
+                self.assertFalse(status[known].missing)
+        write_json(self.status_file, {"primary": None, "weekly": None})
+        self.assertTrue(all(window.missing for window in usage.codex_status().values()))
+
+    def test_pro_missing_or_invalid_secondary_is_unknown(self):
+        for value in ("absent", "invalid", 12, [], {}):
+            with self.subTest(value=value):
+                data = {"primary": {
+                    "usedPercent": 40, "windowDurationMins": 10080, "resetsAt": RESET_TS,
+                }}
+                if value != "absent":
+                    data["weekly"] = value
+                write_json(self.status_file, data)
+                status = usage.codex_status()
+                self.assertIsNone(status["5h"].used_pct)
+                self.assertFalse(status["5h"].missing)
+                self.assertEqual(status["7d"].used_pct, 40)
+                self.assertFalse(status["7d"].missing)
+
+    def test_non_object_cache_is_unknown(self):
+        for value in ([1], "invalid", 12, True):
+            with self.subTest(value=value):
+                write_json(self.status_file, value)
+                for window in usage.codex_status().values():
+                    self.assertIsNone(window.used_pct)
+                    self.assertFalse(window.missing)
+
     def test_pro_primary_is_seven_day(self):
         write_json(self.status_file, {
             "primary": {"usedPercent": 40, "windowDurationMins": 10080, "resetsAt": RESET_TS},
@@ -161,17 +237,51 @@ class CodexStatusTest(unittest.TestCase):
 
 
 class FallbackStatusTest(unittest.TestCase):
-    def test_missing_window_marked(self):
-        out = usage.fallback_status(
-            [sys.executable, "-c", "print('7d  [##########----------] 50%')"], "claude")
-        self.assertEqual(out["7d"].used_pct, 50)
-        self.assertTrue(out["5h"].missing)
+    def parse(self, stdout, parser):
+        result = mock.Mock(stdout=stdout, returncode=0)
+        with mock.patch.object(usage.subprocess, "run", return_value=result):
+            return usage.fallback_status(["mock-quota", "--status"], parser)
+
+    def line(self, parser, slot, percent):
+        if parser == "claude":
+            return f"{slot}  [##########----------] {percent}%"
+        return f"{slot}: 已使用 {percent}% | 重置 未知时间"
+
+    def test_omitted_window_stays_unknown(self):
+        for parser in ("claude", "codex"):
+            for known, unknown in (("7d", "5h"), ("5h", "7d")):
+                with self.subTest(parser=parser, known=known):
+                    out = self.parse(self.line(parser, known, 50), parser)
+                    self.assertEqual(out[known].used_pct, 50)
+                    self.assertFalse(out[known].missing)
+                    self.assertIsNone(out[unknown].used_pct)
+                    self.assertFalse(out[unknown].missing)
+
+    def test_unparseable_window_stays_unknown(self):
+        for parser in ("claude", "codex"):
+            for bad in (self.line(parser, "5h", "?"), "5h: unavailable"):
+                with self.subTest(parser=parser, bad=bad):
+                    out = self.parse(bad + "\n" + self.line(parser, "7d", 50), parser)
+                    self.assertEqual(out["7d"].used_pct, 50)
+                    self.assertIsNone(out["5h"].used_pct)
+                    self.assertFalse(out["5h"].missing)
 
     def test_no_output_stays_unknown(self):
-        out = usage.fallback_status([sys.executable, "-c", "pass"], "claude")
-        self.assertIsNone(out["5h"].used_pct)
-        self.assertFalse(out["5h"].missing)
-        self.assertFalse(out["7d"].missing)
+        for parser in ("claude", "codex"):
+            with self.subTest(parser=parser):
+                out = self.parse("", parser)
+                for window in out.values():
+                    self.assertIsNone(window.used_pct)
+                    self.assertFalse(window.missing)
+
+    def test_command_failure_stays_unknown(self):
+        for parser in ("claude", "codex"):
+            with self.subTest(parser=parser), \
+                 mock.patch.object(usage.subprocess, "run", side_effect=OSError("unavailable")):
+                out = usage.fallback_status(["mock-quota", "--status"], parser)
+                for window in out.values():
+                    self.assertIsNone(window.used_pct)
+                    self.assertFalse(window.missing)
 
 
 class PrintServiceTest(unittest.TestCase):
@@ -191,6 +301,73 @@ class PrintServiceTest(unittest.TestCase):
         self.assertIn("无 5h 限制", out)
         self.assertIn("7d", out)
         self.assertIn("30%", out)
+
+    def test_codex_unknown_cache_render(self):
+        for unknown, known, data in (
+            ("5h", "7d", {"weekly": {"usedPercent": 25}}),
+            ("7d", "5h", {"primary": {"usedPercent": 25}}),
+            ("5h", "7d", {
+                "primary": {"usedPercent": 25, "windowDurationMins": 10080},
+                "weekly": "invalid",
+            }),
+        ):
+            with self.subTest(unknown=unknown, data=data), \
+                 mock.patch.object(usage, "load_json", return_value=data):
+                status = usage.codex_status()
+                out = self.render(status)
+                self.assertIn("??%", out)
+                self.assertNotIn(f"无 {unknown} 限制", out)
+                self.assertNotIn(f"无 {known} 限制", out)
+                self.assertIn("25%", out)
+
+    def test_codex_explicit_null_cache_render(self):
+        for data, missing in (
+            ({"primary": None, "weekly": {"usedPercent": 25}}, "5h"),
+            ({"primary": {"usedPercent": 25}, "weekly": None}, "7d"),
+            ({"primary": {"usedPercent": 25, "windowDurationMins": 10080},
+              "weekly": None}, "5h"),
+        ):
+            with self.subTest(missing=missing, data=data), \
+                 mock.patch.object(usage, "load_json", return_value=data):
+                out = self.render(usage.codex_status())
+                self.assertIn(f"无 {missing} 限制", out)
+                self.assertIn("25%", out)
+                self.assertNotIn("??%", out)
+        with mock.patch.object(usage, "load_json", return_value={"primary": None, "weekly": None}):
+            out = self.render(usage.codex_status())
+        self.assertIn("无 5h 限制", out)
+        self.assertIn("无 7d 限制", out)
+
+    def test_fallback_unknown_render(self):
+        for parser in ("claude", "codex"):
+            stdout = ("5h [----] ?%\n7d [####] 25%" if parser == "claude"
+                      else "5h: 已使用 ?%\n7d: 已使用 25%")
+            with self.subTest(parser=parser), \
+                 mock.patch.object(usage.subprocess, "run", return_value=mock.Mock(stdout=stdout)):
+                out = self.render(usage.fallback_status(["mock-quota"], parser))
+            self.assertIn("??%", out)
+            self.assertIn("25%", out)
+            self.assertNotIn("无 5h 限制", out)
+            self.assertNotIn("无 7d 限制", out)
+
+    def test_quota_wait_missing_reset_render(self):
+        quota_wait = load_module("quota_wait_script", "../mac/quota-wait")
+        buf = io.StringIO()
+        windows = quota_wait.parse_windows({
+            "five_hour": {"utilization": 15},
+            "seven_day": {"utilization": 25, "resets_at": RESET_ISO},
+        })
+        quota_wait.print_status(windows, file=buf)
+        self.assertNotIn("5h", buf.getvalue())
+        self.assertIn("7d", buf.getvalue())
+        with mock.patch.object(usage.subprocess, "run", return_value=mock.Mock(stdout=buf.getvalue())):
+            status = usage.fallback_status(["mock-quota-wait", "--status"], "claude")
+        self.assertFalse(status["5h"].missing)
+        self.assertIsNone(status["5h"].used_pct)
+        out = self.render(status)
+        self.assertIn("??%", out)
+        self.assertIn("25%", out)
+        self.assertNotIn("无 5h 限制", out)
 
     def test_old_format_unchanged(self):
         out = self.render({

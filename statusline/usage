@@ -390,7 +390,6 @@ def fallback_status(command: list[str], parser: str) -> dict[str, WindowStatus]:
     except Exception:
         return {"5h": WindowStatus(), "7d": WindowStatus()}
     out = {"5h": WindowStatus(), "7d": WindowStatus()}
-    matched = 0
     for line in proc.stdout.splitlines():
         if parser == "claude":
             match = re.search(r"^(5h|7d)\s+\[[^\]]+\]\s+(\d+(?:\.\d+)?)%", line)
@@ -398,12 +397,7 @@ def fallback_status(command: list[str], parser: str) -> dict[str, WindowStatus]:
             match = re.search(r"^(5h|7d):\s+已使用\s+(\d+(?:\.\d+)?)%", line)
         if match:
             out[match.group(1)].used_pct = float(match.group(2))
-            matched += 1
-    if matched:
-        # 命令正常输出但缺某个窗口 → 订阅没有该窗口（如 Ultra/Pro 无 5h）。
-        for ws in out.values():
-            if ws.used_pct is None:
-                ws.missing = True
+    # 省略或无法解析的窗口没有明确缺席证据，保留未知状态。
     return out
 
 
@@ -427,7 +421,7 @@ def claude_status() -> dict[str, WindowStatus]:
     if not data:
         return fallback_status([str(HOME / "bin" / "quota-wait"), "--status"], "claude")
 
-    limits = data.get("rate_limits")
+    limits = data.get("rate_limits") if isinstance(data, dict) else None
     if not isinstance(limits, dict):
         # rate_limits 为 null/缺失（且 tt-statusline 无历史可沿用）→ 两个窗口都未知
         return {"5h": WindowStatus(), "7d": WindowStatus()}
@@ -444,16 +438,32 @@ def codex_status() -> dict[str, WindowStatus]:
 
     # 窗口槽位按时长判：ChatGPT Pro 的 primary 就是 7 天窗口、secondary=null。
     # 没有 windowDurationMins 的旧数据沿用旧映射 primary=5h、weekly=7d。
-    out = {"5h": WindowStatus(missing=True), "7d": WindowStatus(missing=True)}
+    out = {"5h": WindowStatus(), "7d": WindowStatus()}
+    if not isinstance(data, dict):
+        return out
+    populated = set()
+    null_slots = []
     for name, default_slot in (("primary", "5h"), ("weekly", "7d")):
-        window = data.get(name)
-        if not isinstance(window, dict):
+        if name not in data:
+            continue
+        window = data[name]
+        if window is None:
+            null_slots.append(default_slot)
+            continue
+        if not isinstance(window, dict) or not window:
             continue
         mins = _num(window.get("windowDurationMins"))
         slot = ("7d" if mins >= 1440 else "5h") if mins else default_slot
         out[slot] = WindowStatus(
             _num(window.get("usedPercent")), parse_time(window.get("resetsAt")),
         )
+        populated.add(slot)
+    # 显式 null 才表示没有窗口；Pro 的有效 7d 不能被 weekly=null 覆盖。
+    for slot in null_slots:
+        if slot in populated:
+            slot = "7d" if slot == "5h" else "5h"
+        if slot not in populated:
+            out[slot] = WindowStatus(missing=True)
     return out
 
 
