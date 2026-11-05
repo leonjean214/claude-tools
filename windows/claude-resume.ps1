@@ -18,14 +18,16 @@ try {
     $qResp = Invoke-RestMethod -Uri "https://api.anthropic.com/api/oauth/usage" `
         -Headers @{ "Authorization" = "Bearer $qToken" } -ErrorAction Stop
 
-    $u5 = [float]($qResp.five_hour.utilization ?? 0)
-    $r5 = $qResp.five_hour.resets_at
+    # 无 5h 窗口的套餐（如 Claude Ultra）five_hour 为 null
+    $u5 = if ($null -ne $qResp.five_hour) { [float]($qResp.five_hour.utilization ?? 0) } else { $null }
+    $r5 = if ($null -ne $qResp.five_hour) { $qResp.five_hour.resets_at } else { $null }
     $u7 = [float]($qResp.seven_day.utilization ?? 0)
     $r7 = $qResp.seven_day.resets_at
 
-    Add-Content -Path $logPath -Value "[$((Get-Date).ToString('HH:mm:ss'))] Quota: 5h=$([math]::Round($u5))% 7d=$([math]::Round($u7))%"
+    $u5txt = if ($null -eq $u5) { "none" } else { "$([math]::Round($u5))%" }
+    Add-Content -Path $logPath -Value "[$((Get-Date).ToString('HH:mm:ss'))] Quota: 5h=$u5txt 7d=$([math]::Round($u7))%"
 
-    if ($u5 -ge 100 -and $r5) {
+    if ($null -ne $u5 -and $u5 -ge 100 -and $r5) {
         $shouldSkip = $true
         $waitUntil  = [DateTimeOffset]::Parse($r5).LocalDateTime.AddMinutes(1)
     } elseif ($u7 -ge 100 -and $r7) {

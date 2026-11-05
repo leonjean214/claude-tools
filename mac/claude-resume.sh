@@ -26,14 +26,15 @@ if [ -n "$_QUOTA_TOKEN" ]; then
     _RESULT=$(echo "$_QUOTA_JSON" | python3 -c "
 import json, sys, datetime
 d = json.load(sys.stdin)
-fh = d.get('five_hour') or {}
+fh = d.get('five_hour')          # 无 5h 窗口的套餐（如 Ultra）返回 null
 sd = d.get('seven_day') or {}
-u5 = fh.get('utilization') or 0
-r5 = fh.get('resets_at') or ''
+u5 = fh.get('utilization') if isinstance(fh, dict) else None
+r5 = (fh or {}).get('resets_at') or ''
 u7 = sd.get('utilization') or 0
 r7 = sd.get('resets_at') or ''
-print(f'5h={u5:.0f}% 7d={u7:.0f}%')
-if u5 >= 100 and r5:
+u5s = 'none' if u5 is None else f'{u5:.0f}%'
+print(f'5h={u5s} 7d={u7:.0f}%')
+if u5 is not None and u5 >= 100 and r5:
     dt = datetime.datetime.fromisoformat(r5).astimezone()
     print(f'WAIT:{int(dt.timestamp())+60}:5h@{dt.strftime(\"%H:%M\")}')
 elif u7 >= 100 and r7:

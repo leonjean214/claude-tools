@@ -98,6 +98,9 @@ ANTHROPIC_WRITE_1H = 2.0
 class WindowStatus:
     used_pct: float | None = None
     reset_at: dt.datetime | None = None
+    # 订阅没有该窗口（Claude Ultra 的 five_hour、ChatGPT Pro 的 5h 窗口返回 null）。
+    # 与"有窗口但数据缺失"(used_pct=None)区分，显示"无限制"而不是"??%"。
+    missing: bool = False
 
 
 @dataclass
@@ -387,6 +390,7 @@ def fallback_status(command: list[str], parser: str) -> dict[str, WindowStatus]:
     except Exception:
         return {"5h": WindowStatus(), "7d": WindowStatus()}
     out = {"5h": WindowStatus(), "7d": WindowStatus()}
+    matched = 0
     for line in proc.stdout.splitlines():
         if parser == "claude":
             match = re.search(r"^(5h|7d)\s+\[[^\]]+\]\s+(\d+(?:\.\d+)?)%", line)
@@ -394,7 +398,26 @@ def fallback_status(command: list[str], parser: str) -> dict[str, WindowStatus]:
             match = re.search(r"^(5h|7d):\s+已使用\s+(\d+(?:\.\d+)?)%", line)
         if match:
             out[match.group(1)].used_pct = float(match.group(2))
+            matched += 1
+    if matched:
+        # 命令正常输出但缺某个窗口 → 订阅没有该窗口（如 Ultra/Pro 无 5h）。
+        for ws in out.values():
+            if ws.used_pct is None:
+                ws.missing = True
     return out
+
+
+def _rate_window(limits: dict[str, Any], key: str) -> WindowStatus:
+    entry = limits.get(key)
+    if entry is None:
+        # 订阅没有该窗口（如 Claude Ultra 的 five_hour=null）
+        return WindowStatus(missing=True)
+    if not isinstance(entry, dict):
+        return WindowStatus()
+    return WindowStatus(
+        used_pct=_num(entry.get("used_percentage")),
+        reset_at=parse_time(entry.get("resets_at")),
+    )
 
 
 def claude_status() -> dict[str, WindowStatus]:
@@ -404,14 +427,8 @@ def claude_status() -> dict[str, WindowStatus]:
 
     limits = data.get("rate_limits") or {}
     return {
-        "5h": WindowStatus(
-            used_pct=_num((limits.get("five_hour") or {}).get("used_percentage")),
-            reset_at=parse_time((limits.get("five_hour") or {}).get("resets_at")),
-        ),
-        "7d": WindowStatus(
-            used_pct=_num((limits.get("seven_day") or {}).get("used_percentage")),
-            reset_at=parse_time((limits.get("seven_day") or {}).get("resets_at")),
-        ),
+        "5h": _rate_window(limits, "five_hour"),
+        "7d": _rate_window(limits, "seven_day"),
     }
 
 
@@ -420,12 +437,19 @@ def codex_status() -> dict[str, WindowStatus]:
     if not data:
         return fallback_status([str(HOME / "bin" / "codex-quota-watch"), "--status"], "codex")
 
-    primary = data.get("primary") or {}
-    weekly = data.get("weekly") or {}
-    return {
-        "5h": WindowStatus(_num(primary.get("usedPercent")), parse_time(primary.get("resetsAt"))),
-        "7d": WindowStatus(_num(weekly.get("usedPercent")), parse_time(weekly.get("resetsAt"))),
-    }
+    # 窗口槽位按时长判：ChatGPT Pro 的 primary 就是 7 天窗口、secondary=null。
+    # 没有 windowDurationMins 的旧数据沿用旧映射 primary=5h、weekly=7d。
+    out = {"5h": WindowStatus(missing=True), "7d": WindowStatus(missing=True)}
+    for name, default_slot in (("primary", "5h"), ("weekly", "7d")):
+        window = data.get(name)
+        if not isinstance(window, dict):
+            continue
+        mins = _num(window.get("windowDurationMins"))
+        slot = ("7d" if mins >= 1440 else "5h") if mins else default_slot
+        out[slot] = WindowStatus(
+            _num(window.get("usedPercent")), parse_time(window.get("resetsAt")),
+        )
+    return out
 
 
 def _num(value: Any) -> float | None:
@@ -1078,10 +1102,14 @@ def print_service(
 ) -> None:
     s5 = status.get("5h") or WindowStatus()
     s7 = status.get("7d") or WindowStatus()
-    print(
-        f"{name:<7} 5h [{bar(s5.used_pct)}] {fmt_pct(s5.used_pct):>4} reset {fmt_reset(s5.reset_at):<16} "
-        f"7d [{bar(s7.used_pct)}] {fmt_pct(s7.used_pct):>4} reset {fmt_reset(s7.reset_at)}"
-    )
+
+    def quota(label: str, ws: WindowStatus, pad: int = 0) -> str:
+        text = (f"{label} 无 {label} 限制" if ws.missing
+                else f"{label} [{bar(ws.used_pct)}] {fmt_pct(ws.used_pct):>4} "
+                     f"reset {fmt_reset(ws.reset_at)}")
+        return f"{text:<{pad}}" if pad else text
+
+    print(f"{name:<7} {quota('5h', s5, 43)} {quota('7d', s7)}")
     note = " 估算" if costs.estimated else ""
     cycle_text = f"本期 {cycle[0]:%m-%d} → {cycle[1]:%m-%d}"
     print(

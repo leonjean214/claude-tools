@@ -3,7 +3,7 @@
 
 
 显示内容：
-- **5h / 7d 额度进度条**、已用百分比、距离重置的时间（来自 Claude Code 传给 status line 的 `rate_limits`，订阅用户才有）
+- **5h / 7d 额度进度条**、已用百分比、距离重置的时间（来自 Claude Code 传给 status line 的 `rate_limits`，订阅用户才有；没有 5h 窗口的套餐——Claude Ultra、ChatGPT Pro——只显示周窗口）
 - 上下文窗口占用条、tokens 进出、缓存命中
 - git 分支和是否有未提交改动、会话时长、模型 / effort / fast
 - 可选：等价 API 费用（需要同目录的 `usage`）、Codex 额度（需要 `codex-quota-watch` 写出的 `~/.codex/quota-status.json`）
