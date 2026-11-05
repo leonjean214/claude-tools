@@ -55,5 +55,10 @@ $emoji = if ($status -eq "allowed") { "[OK]" } elseif ($status -like "*warning*"
 $now   = (Get-Date).ToString("HH:mm:ss")
 
 Write-Output "=== Claude Quota $emoji $status  [$now] ==="
-Write-Output "5h  [$(Bar $util5h)] $([math]::Round([float]$util5h*100))%  reset $(FmtTs $reset5h)  $st5h"
+if ($util5h) {
+    Write-Output "5h  [$(Bar $util5h)] $([math]::Round([float]$util5h*100))%  reset $(FmtTs $reset5h)  $st5h"
+} else {
+    # 无 5h 窗口的套餐（如 Claude Ultra）不下发 5h 头
+    Write-Output "5h  无 5h 限制"
+}
 Write-Output "7d  [$(Bar $util7d)] $([math]::Round([float]$util7d*100))%  reset $(FmtTs $reset7d)  $st7d"

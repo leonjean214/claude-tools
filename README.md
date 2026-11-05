@@ -907,9 +907,14 @@ cp wsl/claude-resume.sh ~/bin/claude-resume.sh && chmod +x ~/bin/claude-resume.s
 
 | Field | Meaning |
 |---|---|
-| `five_hour.utilization` | 0–100, usage in the current 5-hour window |
+| `five_hour.utilization` | 0–100, usage in the current 5-hour window (`five_hour` is `null` on plans without a 5h window, e.g. Claude Ultra) |
 | `five_hour.resets_at` | ISO 8601 reset timestamp for 5h window |
 | `seven_day.utilization` | 0–100, usage in the current 7-day window |
 | `seven_day.resets_at` | ISO 8601 reset timestamp for 7d window |
+
+> Plans without a 5h window (Claude Ultra, or ChatGPT Pro on the Codex side where
+> `primary` is the 7-day window and `secondary` is `null`) skip/hide the 5h
+> display — weekly quota and reset time are shown as usual. Older data with
+> both windows is handled exactly as before.
 
 > ⚠️ `GET /api/oauth/usage` is undocumented and may change without notice.

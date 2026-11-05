@@ -42,11 +42,11 @@ try:
 except Exception as e:
     print(f"❌ API 调用失败: {e}"); sys.exit(1)
 
-fh = data.get("five_hour") or {}
+fh = data.get("five_hour")   # Claude Ultra 等套餐没有 5h 窗口，返回 null
 sd = data.get("seven_day") or {}
 
-u5  = fh.get("utilization") or 0
-r5  = fh.get("resets_at", "")
+u5  = (fh or {}).get("utilization") or 0
+r5  = (fh or {}).get("resets_at", "")
 u7  = sd.get("utilization") or 0
 r7  = sd.get("resets_at", "")
 
@@ -54,5 +54,8 @@ now = datetime.datetime.now().strftime("%H:%M:%S")
 overall = icon(max(u5, u7))
 
 print(f"=== Claude 额度 {overall}  [{now}] ===")
-print(f"5h  [{bar(u5)}] {u5:.0f}%  reset {fmt_ts(r5)}")
+if fh is None:
+    print("5h  无 5h 限制")
+else:
+    print(f"5h  [{bar(u5)}] {u5:.0f}%  reset {fmt_ts(r5)}")
 print(f"7d  [{bar(u7)}] {u7:.0f}%  reset {fmt_ts(r7)}")

@@ -97,6 +97,28 @@ def local_time(timestamp):
     return dt.datetime.fromtimestamp(timestamp).astimezone().strftime("%Y-%m-%d %H:%M")
 
 
+def window_hours(name, window):
+    """窗口时长（小时）。ChatGPT Pro 的 primary 就是 7 天窗口；
+    没有 windowDurationMins 的旧数据沿用旧映射 primary=5h、weekly=7d。"""
+    try:
+        mins = int((window or {}).get("windowDurationMins") or 0)
+    except (TypeError, ValueError):
+        mins = 0
+    if mins:
+        return mins / 60
+    return 5.0 if name == "primary" else 168.0
+
+
+def window_label(name, window):
+    hours = window_hours(name, window)
+    return f"{hours / 24:g}d" if hours >= 24 else f"{hours:g}h"
+
+
+def notify_label(name, window):
+    hours = window_hours(name, window)
+    return (f"{hours / 24:g} 天额度" if hours >= 24 else f"{hours:g} 小时额度")
+
+
 def notify(title, message):
     script = 'display notification {message} with title {title} sound name "Glass"'
     subprocess.run(
@@ -126,8 +148,11 @@ def notify_crossings(status):
     state = load_json(STATE_FILE, {"windows": {}})
     windows_state = state.setdefault("windows", {})
 
-    for name, label in (("primary", "5 小时额度"), ("weekly", "Weekly 额度")):
-        window = status.get(name) or {}
+    for name in ("primary", "weekly"):
+        window = status.get(name)
+        if not isinstance(window, dict) or not window:
+            continue  # 订阅没有该窗口（如 ChatGPT Pro 无 5h 窗口，secondary=null）
+        label = notify_label(name, window)
         used = int(window.get("usedPercent", 0))
         reset = window.get("resetsAt")
         previous = windows_state.get(name, {})
@@ -159,10 +184,12 @@ def notify_crossings(status):
 
 def print_status(status):
     print(f"Codex {status.get('planType') or 'unknown'} | 更新 {status['updatedAt']}")
-    for key, label in (("primary", "5h"), ("weekly", "7d")):
-        window = status.get(key) or {}
+    for key in ("primary", "weekly"):
+        window = status.get(key)
+        if not isinstance(window, dict) or not window:
+            continue  # 订阅没有该窗口（如 ChatGPT Pro 无 5h 窗口）
         print(
-            f"{label}: 已使用 {window.get('usedPercent', '?')}% | "
+            f"{window_label(key, window)}: 已使用 {window.get('usedPercent', '?')}% | "
             f"重置 {local_time(window.get('resetsAt'))}"
         )
 
